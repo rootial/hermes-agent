@@ -3205,13 +3205,16 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         return False
 
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> bool:
     """Check if fork is behind upstream and sync if safe.
+
+    Returns True if upstream changes were pulled/rebased, False otherwise.
 
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
     - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
+    - If behind with local commits, rebase onto upstream/main
+    - If behind without local commits, fast-forward pull
     - Try to sync fork back to origin if possible
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
@@ -3219,7 +3222,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     if not has_upstream:
         # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return False
 
         # Ask user if they want to add upstream
         print()
@@ -3239,11 +3242,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return False
         else:
             print("  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later.")
             _mark_skip_upstream_prompt()
-            return
+            return False
 
     # Fetch upstream
     print()
@@ -3257,7 +3260,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         )
     except subprocess.CalledProcessError:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+        return False
 
     # Compare origin/main with upstream/main
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
@@ -3265,7 +3268,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
+        return False
 
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
@@ -3273,7 +3276,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             print(f"  ✓ Fork is up to date with upstream ({origin_ahead} local commit(s) on top)")
         else:
             print("  ✓ Fork is up to date with upstream")
-        return
+        return False
 
     # Upstream has new commits
     print()
@@ -3306,7 +3309,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             print("    cd ~/.hermes/hermes-agent")
             print("    git rebase upstream/main")
             print("    # fix conflicts, then: git rebase --continue")
-            return
+            return False
         print(f"  ✓ Rebased {origin_ahead} local commit(s) onto upstream/main")
     else:
         # No local commits — fast-forward
@@ -3319,7 +3322,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             )
         except subprocess.CalledProcessError:
             print("  ✗ Failed to pull from upstream.")
-            return
+            return False
         print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
@@ -3329,6 +3332,8 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     else:
         print("  ℹ Got updates from upstream but couldn't push to fork (no write access?)")
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
+    return True
 
 
 def _invalidate_update_cache():

@@ -7514,38 +7514,60 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
-
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
+        if origin_ahead > 0:
+            print(f"  ✓ Fork is up to date with upstream ({origin_ahead} local commit(s) on top)")
+        else:
+            print("  ✓ Fork is up to date with upstream")
         return
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
+    # Upstream has new commits
     print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
+    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream", end="")
+    if origin_ahead > 0:
+        print(f", {origin_ahead} local commit(s) on top")
+    else:
+        print()
 
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
-        return
-
-    print("  ✓ Updated from upstream")
+    if origin_ahead > 0:
+        # Fork has local commits — rebase onto upstream/main
+        print("→ Rebasing local commits onto upstream/main...")
+        try:
+            subprocess.run(
+                git_cmd + ["rebase", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            # Rebase failed (conflict) — abort and let user handle manually
+            subprocess.run(
+                git_cmd + ["rebase", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            print("  ✗ Rebase conflict. Aborted automatically.")
+            print("  Resolve manually:")
+            print("    cd ~/.hermes/hermes-agent")
+            print("    git rebase upstream/main")
+            print("    # fix conflicts, then: git rebase --continue")
+            return
+        print(f"  ✓ Rebased {origin_ahead} local commit(s) onto upstream/main")
+    else:
+        # No local commits — fast-forward
+        print("→ Pulling from upstream...")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print("  ✗ Failed to pull from upstream.")
+            return
+        print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
@@ -8875,6 +8897,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _update_via_zip(args)
         return
 
+    # Fork-aware update: sync with upstream BEFORE pulling from origin
+    if is_fork:
+        _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+
     # Fetch and pull
     try:
 
@@ -9134,10 +9160,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
-
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

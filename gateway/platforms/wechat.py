@@ -146,7 +146,7 @@ def _from_platform_config(config: PlatformConfig) -> WeChatAdapterConfig:
     except Exception:
         poll_timeout_seconds = 35
 
-    profile = str(extra.get("profile") or os.getenv("HERMES_ACTIVE_PROFILE", "default")).strip() or "default"
+    profile = str(extra.get("profile") or os.getenv("HERMES_ACTIVE_PROFILE", "")).strip() or None
 
     return WeChatAdapterConfig(
         ilink_url=ilink_url.rstrip("/"),

@@ -665,8 +665,8 @@ class DiscordAdapter(BasePlatformAdapter):
             if hasattr(self, '_bot_task') and self._bot_task:
                 self._bot_task.cancel()
                 try:
-                    await self._bot_task
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(asyncio.shield(self._bot_task), timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
             try:
                 await self._client.close()

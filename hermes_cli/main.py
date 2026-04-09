@@ -86,6 +86,8 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
 
+    existing_hermes_home = os.getenv("HERMES_HOME", "").strip()
+
     # 1. Check for explicit -p / --profile flag
     for i, arg in enumerate(argv):
         if arg in ("--profile", "-p") and i + 1 < len(argv):
@@ -97,8 +99,9 @@ def _apply_profile_override() -> None:
             consume = 1
             break
 
-    # 2. If no flag, check ~/.hermes/active_profile
-    if profile_name is None:
+    # 2. If no flag, check ~/.hermes/active_profile only when the caller has
+    # not already pinned a specific HERMES_HOME (for example via launchd).
+    if profile_name is None and not existing_hermes_home:
         try:
             active_path = Path.home() / ".hermes" / "active_profile"
             if active_path.exists():
@@ -666,6 +669,13 @@ def cmd_gateway(args):
     """Gateway management commands."""
     from hermes_cli.gateway import gateway_command
     gateway_command(args)
+
+
+def cmd_wechat(args):
+    """WeChat CLI commands."""
+    from hermes_cli.wechat import wechat_command
+
+    wechat_command(args)
 
 
 def cmd_whatsapp(args):
@@ -3257,36 +3267,60 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
-
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
+        if origin_ahead > 0:
+            print(f"  ✓ Fork is up to date with upstream ({origin_ahead} local commit(s) on top)")
+        else:
+            print("  ✓ Fork is up to date with upstream")
         return
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
+    # Upstream has new commits
     print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
+    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream", end="")
+    if origin_ahead > 0:
+        print(f", {origin_ahead} local commit(s) on top")
+    else:
+        print()
 
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
-        return
-
-    print("  ✓ Updated from upstream")
+    if origin_ahead > 0:
+        # Fork has local commits — rebase onto upstream/main
+        print("→ Rebasing local commits onto upstream/main...")
+        try:
+            subprocess.run(
+                git_cmd + ["rebase", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            # Rebase failed (conflict) — abort and let user handle manually
+            subprocess.run(
+                git_cmd + ["rebase", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            print("  ✗ Rebase conflict. Aborted automatically.")
+            print("  Resolve manually:")
+            print("    cd ~/.hermes/hermes-agent")
+            print("    git rebase upstream/main")
+            print("    # fix conflicts, then: git rebase --continue")
+            return
+        print(f"  ✓ Rebased {origin_ahead} local commit(s) onto upstream/main")
+    else:
+        # No local commits — fast-forward
+        print("→ Pulling from upstream...")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print("  ✗ Failed to pull from upstream.")
+            return
+        print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
@@ -3456,6 +3490,10 @@ def cmd_update(args):
         _update_via_zip(args)
         return
 
+    # Fork-aware update: sync with upstream BEFORE pulling from origin
+    if is_fork:
+        _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+
     # Fetch and pull
     try:
 
@@ -3593,10 +3631,6 @@ def cmd_update(args):
         if removed:
             print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
-        
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
         # individually so update does not silently strip working capabilities.
@@ -4498,6 +4532,52 @@ For more help on a command:
         help="Reset configuration to defaults"
     )
     setup_parser.set_defaults(func=cmd_setup)
+
+    # =========================================================================
+    # wechat command
+    # =========================================================================
+    wechat_parser = subparsers.add_parser(
+        "wechat",
+        help="Manage WeChat integration",
+        description="WeChat utilities (bind/status)"
+    )
+    wechat_subparsers = wechat_parser.add_subparsers(dest="wechat_action")
+    wechat_bind = wechat_subparsers.add_parser(
+        "bind",
+        help="Bind via QR callback and persist bearer token"
+    )
+    wechat_bind.add_argument(
+        "--base-url",
+        default="",
+        help="iLink base URL (defaults to WECHAT_ILINK_URL or config)"
+    )
+    wechat_bind.add_argument(
+        "--listen-host",
+        default="127.0.0.1",
+        help="Local callback host for /auth/bind (default: 127.0.0.1)"
+    )
+    wechat_bind.add_argument(
+        "--listen-port",
+        type=int,
+        default=0,
+        help="Local callback port for /auth/bind (default: random free port)"
+    )
+    wechat_bind.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="Seconds to wait for bind callback (default: 180)"
+    )
+    wechat_status = wechat_subparsers.add_parser(
+        "status",
+        help="Show WeChat gateway configuration and runtime status"
+    )
+    wechat_status.add_argument(
+        "--base-url",
+        default="",
+        help="Override iLink base URL for status resolution"
+    )
+    wechat_parser.set_defaults(func=cmd_wechat)
 
     # =========================================================================
     # whatsapp command

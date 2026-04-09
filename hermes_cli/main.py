@@ -3491,8 +3491,9 @@ def cmd_update(args):
         return
 
     # Fork-aware update: sync with upstream BEFORE pulling from origin
+    fork_synced_upstream = False
     if is_fork:
-        _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+        fork_synced_upstream = _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
     # Fetch and pull
     try:
@@ -3560,7 +3561,7 @@ def cmd_update(args):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        if commit_count == 0 and not fork_synced_upstream:
             _invalidate_update_cache()
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:

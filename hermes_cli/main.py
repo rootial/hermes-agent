@@ -8898,8 +8898,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         return
 
     # Fork-aware update: sync with upstream BEFORE pulling from origin
+    fork_synced_upstream = False
     if is_fork:
-        _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+        fork_synced_upstream = _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
     # Fetch and pull
     try:
@@ -9008,7 +9009,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        if commit_count == 0 and not fork_synced_upstream:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream

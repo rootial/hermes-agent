@@ -653,11 +653,25 @@ class DiscordAdapter(BasePlatformAdapter):
             # Wait for ready
             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
 
+            # Only start watchdog after successful connection
+            self._reconnect_task = asyncio.create_task(self._reconnect_watchdog())
+
             self._running = True
             return True
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            # Clean up tasks from failed connect
+            if hasattr(self, '_bot_task') and self._bot_task:
+                self._bot_task.cancel()
+                try:
+                    await self._bot_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            try:
+                await self._client.close()
+            except Exception:
+                pass
             try:
                 from gateway.status import release_scoped_lock
                 if getattr(self, '_token_lock_identity', None):
@@ -677,8 +691,94 @@ class DiscordAdapter(BasePlatformAdapter):
                 pass
             return False
 
+    async def _reconnect_watchdog(self) -> None:
+        """Monitor _bot_task and reconnect on failure with exponential backoff.
+
+        discord.py's Client.start(reconnect=True) handles transient WebSocket
+        drops internally.  This watchdog catches the cases that escape that
+        layer (e.g. repeated ConnectionTimeoutError that exhausts discord.py's
+        own retry budget and raises into the task).
+
+        After close(), the client is in a "closed" state; clear() resets it so
+        start() can be called again on the same instance.
+        """
+        backoff = 30
+        max_backoff = 300
+        max_attempts = 20
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                await self._bot_task
+                # Normal exit (e.g. disconnect() called)
+                return
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                attempt += 1
+                logger.warning(
+                    "[%s] Discord connection lost (%s), reconnect attempt %d/%d in %ds",
+                    self.name, exc, attempt, max_attempts, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                try:
+                    await self._client.close()
+                except Exception:
+                    pass
+                try:
+                    # clear() resets is_closed and internal state so start()
+                    # works again on the same Bot instance.
+                    self._client.clear()
+                    self._ready_event.clear()
+                    self._bot_task = asyncio.create_task(
+                        self._client.start(self.config.token)
+                    )
+                    await asyncio.wait_for(self._ready_event.wait(), timeout=60)
+                    logger.info("[%s] Discord reconnected successfully", self.name)
+                    backoff = 30
+                    attempt = 0
+                except Exception as retry_exc:
+                    logger.warning(
+                        "[%s] Discord reconnect failed: %s", self.name, retry_exc,
+                    )
+                    # Cancel the dangling _bot_task so the next loop
+                    # iteration doesn't hang on await self._bot_task.
+                    if self._bot_task and not self._bot_task.done():
+                        self._bot_task.cancel()
+                        try:
+                            await self._bot_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+        # All attempts exhausted — mark adapter as down
+        logger.error("[%s] Discord reconnect exhausted %d attempts, marking disconnected", self.name, max_attempts)
+        self._running = False
+        try:
+            from gateway.status import release_scoped_lock
+            if getattr(self, '_token_lock_identity', None):
+                release_scoped_lock('discord-bot-token', self._token_lock_identity)
+                self._token_lock_identity = None
+        except Exception:
+            pass
+
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        # Cancel reconnect watchdog and wait for it to finish
+        if hasattr(self, '_reconnect_task') and self._reconnect_task:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reconnect_task = None
+
+        # Cancel bot task
+        if hasattr(self, '_bot_task') and self._bot_task and not self._bot_task.done():
+            self._bot_task.cancel()
+            try:
+                await self._bot_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:

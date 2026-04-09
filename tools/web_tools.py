@@ -88,7 +88,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "gemini"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -99,6 +99,7 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
+        ("gemini", _has_env("GEMINI_API_KEY")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -117,6 +118,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "gemini":
+        return _has_env("GEMINI_API_KEY")
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -893,6 +896,73 @@ def _get_exa_client():
     return _exa_client
 
 
+# ─── Gemini Grounding Search ─────────────────────────────────────────────────
+
+def _gemini_search(query: str, limit: int = 5) -> dict:
+    """Search using Gemini's built-in Google Search grounding."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False}
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return {"error": "google-genai package not installed. Run: pip install google-genai", "success": False}
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set", "success": False}
+
+    logger.info("Gemini grounding search: '%s' (limit=%d)", query, limit)
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            f"Search the web for: {query}\n\n"
+            f"Return the top {limit} most relevant results with title, URL, and a brief description."
+        ),
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+
+    web_results = []
+    if response.candidates:
+        candidate = response.candidates[0]
+        meta = getattr(candidate, "grounding_metadata", None)
+        if meta and getattr(meta, "grounding_chunks", None):
+            for i, chunk in enumerate(meta.grounding_chunks[:limit]):
+                web = getattr(chunk, "web", None)
+                if web:
+                    title = getattr(web, "title", "")
+                    uri = getattr(web, "uri", "")
+                    # Grounding URIs are Google redirect URLs; use title
+                    # (which is typically the domain) as a readable label.
+                    web_results.append({
+                        "url": uri,
+                        "title": title,
+                        "description": "",
+                        "position": i + 1,
+                    })
+
+    # Gemini returns a rich synthesized summary — distribute it across results
+    summary = response.text or ""
+    if summary:
+        if web_results:
+            web_results[0]["description"] = summary[:1000]
+        else:
+            # No grounding chunks but model still answered
+            web_results.append({
+                "url": "",
+                "title": "Gemini Summary",
+                "description": summary[:1000],
+                "position": 1,
+            })
+
+    return {"success": True, "data": {"web": web_results}}
+
+
 # ─── Exa Search & Extract Helpers ─────────────────────────────────────────────
 
 def _exa_search(query: str, limit: int = 10) -> dict:
@@ -1094,6 +1164,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "exa":
             response_data = _exa_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "gemini":
+            response_data = _gemini_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1919,9 +1998,9 @@ def check_firecrawl_api_key() -> bool:
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in ("exa", "parallel", "firecrawl", "tavily"):
+    if configured in ("exa", "parallel", "firecrawl", "tavily", "gemini"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "gemini"))
 
 
 def check_auxiliary_model() -> bool:

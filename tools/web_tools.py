@@ -45,7 +45,9 @@ import logging
 import os
 import re
 import asyncio
+import html
 from typing import List, Dict, Any, Optional
+import certifi
 import httpx
 from firecrawl import Firecrawl
 from agent.auxiliary_client import (
@@ -121,6 +123,91 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "gemini":
         return _has_env("GEMINI_API_KEY")
     return False
+
+
+def _get_fallback_chain(primary: str) -> List[str]:
+    """Return the ordered fallback backend chain, skipping unavailable entries.
+
+    Reads ``web.fallback_backends`` from config — a list of backend names to
+    try after the primary raises an exception. Skips backends without an API
+    key so we never waste a fallback slot on something that will fail at
+    client construction.
+    """
+    cfg = _load_web_config()
+    raw = cfg.get("fallback_backends") or []
+    if not isinstance(raw, list):
+        return []
+    chain: List[str] = []
+    for name in raw:
+        name = str(name).lower().strip()
+        if not name or name == primary or name in chain:
+            continue
+        if name not in ("exa", "gemini", "tavily", "parallel", "firecrawl"):
+            continue
+        if not _is_backend_available(name):
+            logger.info("web_search fallback '%s' skipped (no API key)", name)
+            continue
+        chain.append(name)
+    return chain
+
+
+def _extract_html_title(raw_html: str) -> str:
+    """Extract a best-effort title from an HTML document."""
+    match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    title = html.unescape(match.group(1))
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def _html_to_text(raw_html: str) -> str:
+    """Convert HTML to readable plain text without extra dependencies."""
+    text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw_html)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|section|article|main|header|footer|li|ul|ol|h[1-6]|tr|table|blockquote)>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = text.replace("\r", "")
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+async def _basic_http_extract(url: str, requested_format: str | None = None) -> Dict[str, Any]:
+    """Fetch and extract page content using plain HTTP as a no-key fallback."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=certifi.where()) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+    except httpx.ConnectError as exc:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(exc):
+            raise
+        logger.warning("Basic HTTP extraction SSL verification failed for %s; retrying without certificate verification", url)
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=False) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+
+    raw_html = response.text or ""
+    title = _extract_html_title(raw_html)
+    plain_text = _html_to_text(raw_html)
+    final_url = str(response.url)
+    if requested_format == "html":
+        chosen_content = raw_html
+    else:
+        chosen_content = plain_text
+
+    return {
+        "url": final_url,
+        "title": title,
+        "content": chosen_content,
+        "raw_content": chosen_content,
+        "metadata": {"sourceURL": final_url, "title": title},
+    }
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -1151,84 +1238,50 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        # Dispatch to the configured backend
-        backend = _get_backend()
-        if backend == "parallel":
-            response_data = _parallel_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+        # Dispatch to the configured backend, with automatic fallback to
+        # secondary backends on hard failures (exceptions raised by the
+        # primary client — e.g. 429/503/network). An empty result set is NOT
+        # treated as a fallback trigger: the query may legitimately have no
+        # matches, and probing every backend for that case wastes quota.
+        primary = _get_backend()
+        chain = [primary] + _get_fallback_chain(primary)
+        last_error: Optional[Exception] = None
+        response_data: Optional[dict] = None
+        used_backend: Optional[str] = None
 
-        if backend == "exa":
-            response_data = _exa_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+        for backend in chain:
+            try:
+                response_data = _dispatch_search(backend, query, limit)
+                used_backend = backend
+                if backend != primary:
+                    logger.warning(
+                        "web_search: primary '%s' failed, served by fallback '%s'",
+                        primary, backend,
+                    )
+                break
+            except Exception as exc:  # noqa: BLE001 — intentionally broad for fallback
+                last_error = exc
+                logger.warning(
+                    "web_search backend '%s' failed: %s", backend, exc,
+                )
+                if is_interrupted():
+                    raise
 
-        if backend == "gemini":
-            response_data = _gemini_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
+        if response_data is None:
+            # All backends failed — re-raise the last error so existing error
+            # handling below can format it for the caller.
+            raise last_error or RuntimeError("web_search: no backend available")
 
-        if backend == "tavily":
-            logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
-            response_data = _normalize_tavily_search_results(raw)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
-
-        logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
-
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
-
-        web_results = _extract_web_search_results(response)
-        results_count = len(web_results)
-        logger.info("Found %d search results", results_count)
-        
-        # Build response with just search metadata (URLs, titles, descriptions)
-        response_data = {
-            "success": True,
-            "data": {
-                "web": web_results
-            }
-        }
-        
-        # Capture debug information
-        debug_call_data["results_count"] = results_count
-        
-        # Convert to JSON
+        debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+        if used_backend and used_backend != primary:
+            response_data.setdefault("meta", {})["fallback_from"] = primary
+            response_data["meta"]["served_by"] = used_backend
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-        
         debug_call_data["final_response_size"] = len(result_json)
-        
-        # Log debug information
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        
         return result_json
-        
+
     except Exception as e:
         error_msg = f"Error searching web: {str(e)}"
         logger.debug("%s", error_msg)
@@ -1238,6 +1291,36 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         _debug.save()
 
         return tool_error(error_msg)
+
+
+def _dispatch_search(backend: str, query: str, limit: int) -> dict:
+    """Execute a single search against ``backend`` and return normalized result.
+
+    Raises on any backend-level failure; the caller decides whether to fall
+    back. Return shape is always ``{"success": True, "data": {"web": [...]}}``.
+    """
+    if backend == "parallel":
+        return _parallel_search(query, limit)
+    if backend == "exa":
+        return _exa_search(query, limit)
+    if backend == "gemini":
+        return _gemini_search(query, limit)
+    if backend == "tavily":
+        logger.info("Tavily search: '%s' (limit: %d)", query, limit)
+        raw = _tavily_request("search", {
+            "query": query,
+            "max_results": min(limit, 20),
+            "include_raw_content": False,
+            "include_images": False,
+        })
+        return _normalize_tavily_search_results(raw)
+
+    # Default: firecrawl
+    logger.info("Firecrawl search: '%s' (limit: %d)", query, limit)
+    response = _get_firecrawl_client().search(query=query, limit=limit)
+    web_results = _extract_web_search_results(response)
+    logger.info("Found %d search results", len(web_results))
+    return {"success": True, "data": {"web": web_results}}
 
 
 async def web_extract_tool(
@@ -1321,6 +1404,32 @@ async def web_extract_tool(
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
+            elif backend == "gemini" and not check_firecrawl_api_key():
+                logger.info(
+                    "Gemini backend selected without Firecrawl credentials; using basic HTTP extraction fallback"
+                )
+                results = []
+                for url in safe_urls:
+                    blocked = check_website_access(url)
+                    if blocked:
+                        logger.info("Blocked web_extract for %s by rule %s", blocked["host"], blocked["rule"])
+                        results.append({
+                            "url": url, "title": "", "content": "",
+                            "error": blocked["message"],
+                            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+                        })
+                        continue
+                    try:
+                        results.append(await _basic_http_extract(url, format))
+                    except Exception as scrape_err:
+                        logger.debug("Basic HTTP extraction failed for %s: %s", url, scrape_err)
+                        results.append({
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "error": str(scrape_err),
+                        })
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
                 raw = _tavily_request("extract", {

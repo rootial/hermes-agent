@@ -14,7 +14,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from hermes_cli.config import get_env_value, get_hermes_home, save_env_value, is_managed, managed_error
+from hermes_cli.config import get_env_value, get_hermes_home, save_env_value, is_managed, managed_error, load_config
 # display_hermes_home is imported lazily at call sites to avoid ImportError
 # when hermes_constants is cached from a pre-update version during `hermes update`.
 from hermes_cli.setup import (
@@ -1033,6 +1033,24 @@ def generate_launchd_plist() -> str:
     ])
     prog_args_xml = "\n        ".join(prog_args)
 
+    # Always inject HOME — launchd does not set HOME for user agents, which
+    # breaks any code that calls Path.home() or os.path.expanduser("~").
+    home_dir = str(Path.home())
+
+    # Read extra env vars from gateway.extra_env in config.yaml.  This is the
+    # supported mechanism for injecting feature flags (e.g.
+    # HERMES_ENABLE_NOUS_MANAGED_TOOLS=1) without manual plist edits that get
+    # wiped on the next `hermes gateway start`.
+    try:
+        cfg = load_config()
+        extra_env: dict = cfg.get("gateway", {}).get("extra_env", {}) or {}
+    except Exception:
+        extra_env = {}
+
+    extra_env_xml = ""
+    for k, v in extra_env.items():
+        extra_env_xml += f"\n        <key>{k}</key>\n        <string>{v}</string>"
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1044,18 +1062,20 @@ def generate_launchd_plist() -> str:
     <array>
         {prog_args_xml}
     </array>
-    
+
     <key>WorkingDirectory</key>
     <string>{working_dir}</string>
-    
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>{sane_path}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
+        <key>HOME</key>
+        <string>{home_dir}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{hermes_home}</string>{extra_env_xml}
     </dict>
     
     <key>RunAtLoad</key>

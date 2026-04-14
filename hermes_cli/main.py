@@ -1313,13 +1313,6 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
-def cmd_wechat(args):
-    """WeChat CLI commands."""
-    from hermes_cli.wechat import wechat_command
-
-    wechat_command(args)
-
-
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -8313,52 +8306,6 @@ For more help on a command:
              "or unset, instead of running the full reconfigure wizard.",
     )
     setup_parser.set_defaults(func=cmd_setup)
-
-    # =========================================================================
-    # wechat command
-    # =========================================================================
-    wechat_parser = subparsers.add_parser(
-        "wechat",
-        help="Manage WeChat integration",
-        description="WeChat utilities (bind/status)"
-    )
-    wechat_subparsers = wechat_parser.add_subparsers(dest="wechat_action")
-    wechat_bind = wechat_subparsers.add_parser(
-        "bind",
-        help="Bind via QR callback and persist bearer token"
-    )
-    wechat_bind.add_argument(
-        "--base-url",
-        default="",
-        help="iLink base URL (defaults to WECHAT_ILINK_URL or config)"
-    )
-    wechat_bind.add_argument(
-        "--listen-host",
-        default="127.0.0.1",
-        help="Local callback host for /auth/bind (default: 127.0.0.1)"
-    )
-    wechat_bind.add_argument(
-        "--listen-port",
-        type=int,
-        default=0,
-        help="Local callback port for /auth/bind (default: random free port)"
-    )
-    wechat_bind.add_argument(
-        "--timeout",
-        type=int,
-        default=180,
-        help="Seconds to wait for bind callback (default: 180)"
-    )
-    wechat_status = wechat_subparsers.add_parser(
-        "status",
-        help="Show WeChat gateway configuration and runtime status"
-    )
-    wechat_status.add_argument(
-        "--base-url",
-        default="",
-        help="Override iLink base URL for status resolution"
-    )
-    wechat_parser.set_defaults(func=cmd_wechat)
 
     # =========================================================================
     # whatsapp command

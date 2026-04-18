@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -2329,6 +2330,19 @@ def launchd_status(deep: bool = False):
     if loaded:
         print("✓ Gateway service is loaded")
         print(loaded_output)
+        try:
+            from gateway.status import get_running_pid
+            running_pid = get_running_pid()
+        except Exception:
+            running_pid = None
+
+        if running_pid is not None:
+            print(f"✓ Gateway process is running (PID {running_pid})")
+            match = re.search(r'"LastExitStatus"\s*=\s*(-?\d+);', loaded_output)
+            if match:
+                print(
+                    "ℹ launchd LastExitStatus reflects the previous exit, not the current live process"
+                )
     else:
         print("✗ Gateway service is not loaded")
         print("  Service definition exists locally but launchd has not loaded it.")

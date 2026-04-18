@@ -395,6 +395,7 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
+    reset_platforms: bool = False,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -403,7 +404,10 @@ def write_runtime_status(
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
-    payload.setdefault("platforms", {})
+    if reset_platforms:
+        payload["platforms"] = {}
+    else:
+        payload.setdefault("platforms", {})
     payload.setdefault("kind", _GATEWAY_KIND)
     payload["pid"] = os.getpid()
     payload["start_time"] = _get_process_start_time(os.getpid())

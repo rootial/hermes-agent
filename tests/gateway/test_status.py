@@ -312,6 +312,26 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_status_can_reset_stale_platforms_on_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="startup_failed",
+            platform="discord",
+            platform_state="fatal",
+            error_message="stale discord timeout",
+        )
+
+        status.write_runtime_status(
+            gateway_state="starting",
+            exit_reason=None,
+            reset_platforms=True,
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "starting"
+        assert payload["platforms"] == {}
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):

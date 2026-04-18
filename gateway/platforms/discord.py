@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -530,6 +532,105 @@ class DiscordAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
 
+    def _serialize_connector_diagnostics(self, connector: Any) -> Dict[str, Any]:
+        """Return a JSON-safe snapshot of the active aiohttp connector settings."""
+        if connector is None:
+            return {
+                "type": "default",
+                "keepalive_timeout": None,
+                "use_dns_cache": None,
+                "ttl_dns_cache": None,
+                "family": None,
+                "limit": None,
+                "limit_per_host": None,
+                "rdns": None,
+                "ssl": None,
+            }
+        return {
+            "type": type(connector).__name__,
+            "keepalive_timeout": getattr(connector, "_keepalive_timeout", None),
+            "use_dns_cache": getattr(connector, "_use_dns_cache", None),
+            "ttl_dns_cache": getattr(connector, "_cached_hosts", None)
+            and getattr(getattr(connector, "_cached_hosts", None), "_ttl", None),
+            "family": getattr(connector, "_family", None),
+            "limit": getattr(connector, "_limit", None),
+            "limit_per_host": getattr(connector, "_limit_per_host", None),
+            "rdns": getattr(connector, "_rdns", None),
+            "ssl": getattr(connector, "_ssl", None),
+        }
+
+    def _resolve_http_timeout_diagnostics(self) -> Dict[str, Any]:
+        """Return best-effort timeout diagnostics from discord.py's aiohttp session."""
+        http_client = getattr(self._client, "http", None)
+        session = getattr(http_client, "_HTTPClient__session", None)
+        timeout = getattr(session, "timeout", None)
+        if timeout is None:
+            timeout = getattr(http_client, "timeout", None)
+        return {
+            "total": getattr(timeout, "total", None),
+            "connect": getattr(timeout, "connect", None),
+            "sock_connect": getattr(timeout, "sock_connect", None),
+            "sock_read": getattr(timeout, "sock_read", None),
+        }
+
+    def _resolve_active_connector(self, fallback_connector: Any = None) -> Any:
+        """Return the live aiohttp connector when available, else the configured fallback."""
+        http_client = getattr(self._client, "http", None)
+        session = getattr(http_client, "_HTTPClient__session", None)
+        session_connector = getattr(session, "connector", None)
+        if session_connector is not None:
+            return session_connector
+        http_connector = getattr(http_client, "connector", None)
+        if http_connector is not None:
+            return http_connector
+        client_connector = getattr(self._client, "connector", None)
+        if client_connector is not None:
+            return client_connector
+        return fallback_connector
+
+    def _count_pending_tasks(self) -> int:
+        """Return the number of pending tasks on the current event loop."""
+        loop = asyncio.get_running_loop()
+        return sum(1 for task in asyncio.all_tasks(loop) if not task.done())
+
+    def _emit_connection_diagnostic(
+        self,
+        event: str,
+        *,
+        phase: str,
+        started_at: str,
+        started_monotonic: float,
+        attempt: int = 1,
+        max_attempts: int | None = None,
+        backoff_seconds: int | None = None,
+        proxy_url: str | None = None,
+        connector: Any = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Emit a structured WARNING log for Discord connect/reconnect diagnostics."""
+        payload: Dict[str, Any] = {
+            "event": event,
+            "phase": phase,
+            "platform": self.name,
+            "started_at": started_at,
+            "elapsed_ms": round((time.monotonic() - started_monotonic) * 1000, 3),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "backoff_seconds": backoff_seconds,
+            "pending_task_count": self._count_pending_tasks(),
+            "proxy_url": proxy_url,
+            "connector": self._serialize_connector_diagnostics(
+                self._resolve_active_connector(connector)
+            ),
+            "timeout": self._resolve_http_timeout_diagnostics(),
+        }
+        if exc is not None:
+            payload["exception"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+        logger.warning("[%s] Discord diagnostic %s", self.name, json.dumps(payload, sort_keys=True, default=str))
+
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -607,6 +708,9 @@ class DiscordAdapter(BasePlatformAdapter):
             proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             if proxy_url:
                 logger.info("[%s] Using proxy for Discord: %s", self.name, proxy_url)
+            connect_started_at = datetime.now(timezone.utc).isoformat()
+            connect_started_monotonic = time.monotonic()
+            bot_kwargs = proxy_kwargs_for_bot(proxy_url)
 
             # Create bot — proxy= for HTTP, connector= for SOCKS.
             # allowed_mentions is set with safe defaults (no @everyone/roles)
@@ -617,7 +721,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
                 allowed_mentions=_build_allowed_mentions(),
-                **proxy_kwargs_for_bot(proxy_url),
+                **bot_kwargs,
+            )
+            self._emit_connection_diagnostic(
+                "discord_connect_attempt_start",
+                phase="connect",
+                started_at=connect_started_at,
+                started_monotonic=connect_started_monotonic,
+                proxy_url=proxy_url,
+                connector=bot_kwargs.get("connector"),
             )
             adapter_self = self  # capture for closure
 
@@ -759,9 +871,26 @@ class DiscordAdapter(BasePlatformAdapter):
             self._reconnect_task = asyncio.create_task(self._reconnect_watchdog())
 
             self._running = True
+            self._emit_connection_diagnostic(
+                "discord_connect_attempt_success",
+                phase="connect",
+                started_at=connect_started_at,
+                started_monotonic=connect_started_monotonic,
+                proxy_url=proxy_url,
+                connector=bot_kwargs.get("connector"),
+            )
             return True
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            self._emit_connection_diagnostic(
+                "discord_connect_attempt_failure",
+                phase="connect",
+                started_at=connect_started_at,
+                started_monotonic=connect_started_monotonic,
+                proxy_url=proxy_url,
+                connector=bot_kwargs.get("connector") if 'bot_kwargs' in locals() else None,
+                exc=exc,
+            )
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
             # Cancel the bot task and close the client before releasing the
             # lock so a partial connection doesn't leak between reconnects.
@@ -778,6 +907,15 @@ class DiscordAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
         except Exception as e:  # pragma: no cover - defensive logging
+            self._emit_connection_diagnostic(
+                "discord_connect_attempt_failure",
+                phase="connect",
+                started_at=connect_started_at if 'connect_started_at' in locals() else datetime.now(timezone.utc).isoformat(),
+                started_monotonic=connect_started_monotonic if 'connect_started_monotonic' in locals() else time.monotonic(),
+                proxy_url=proxy_url if 'proxy_url' in locals() else None,
+                connector=bot_kwargs.get("connector") if 'bot_kwargs' in locals() else None,
+                exc=e,
+            )
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
             self._release_platform_lock()
             return False
@@ -806,6 +944,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
             except Exception as exc:
                 attempt += 1
+                reconnect_started_at = datetime.now(timezone.utc).isoformat()
+                reconnect_started_monotonic = time.monotonic()
+                connector = self._resolve_active_connector()
+                self._emit_connection_diagnostic(
+                    "discord_reconnect_scheduled",
+                    phase="reconnect",
+                    started_at=reconnect_started_at,
+                    started_monotonic=reconnect_started_monotonic,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    backoff_seconds=backoff,
+                    connector=connector,
+                    exc=exc,
+                )
                 logger.warning(
                     "[%s] Discord connection lost (%s), reconnect attempt %d/%d in %ds",
                     self.name, exc, attempt, max_attempts, backoff,
@@ -821,14 +973,43 @@ class DiscordAdapter(BasePlatformAdapter):
                     # works again on the same Bot instance.
                     self._client.clear()
                     self._ready_event.clear()
+                    self._emit_connection_diagnostic(
+                        "discord_reconnect_attempt_start",
+                        phase="reconnect",
+                        started_at=reconnect_started_at,
+                        started_monotonic=reconnect_started_monotonic,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        backoff_seconds=backoff,
+                        connector=connector,
+                    )
                     self._bot_task = asyncio.create_task(
                         self._client.start(self.config.token)
                     )
                     await asyncio.wait_for(self._ready_event.wait(), timeout=60)
                     logger.info("[%s] Discord reconnected successfully", self.name)
+                    self._emit_connection_diagnostic(
+                        "discord_reconnect_success",
+                        phase="reconnect",
+                        started_at=reconnect_started_at,
+                        started_monotonic=reconnect_started_monotonic,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        connector=connector,
+                    )
                     backoff = 30
                     attempt = 0
                 except Exception as retry_exc:
+                    self._emit_connection_diagnostic(
+                        "discord_reconnect_failure",
+                        phase="reconnect",
+                        started_at=reconnect_started_at,
+                        started_monotonic=reconnect_started_monotonic,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        connector=connector,
+                        exc=retry_exc,
+                    )
                     logger.warning(
                         "[%s] Discord reconnect failed: %s", self.name, retry_exc,
                     )

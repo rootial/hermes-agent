@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -84,14 +86,19 @@ class FakeTree:
 
 
 class FakeBot:
-    def __init__(self, *, intents, proxy=None, allowed_mentions=None, **_):
+    def __init__(self, *, intents, proxy=None, connector=None, allowed_mentions=None, **_):
         self.intents = intents
+        self.proxy = proxy
+        self.connector = connector
         self.allowed_mentions = allowed_mentions
         self.application_id = 999
         self.user = SimpleNamespace(id=999, name="Hermes")
         self._events = {}
         self.tree = FakeTree()
         self.http = SimpleNamespace(
+            _HTTPClient__session=None,
+            timeout=None,
+            connector=connector,
             upsert_global_command=AsyncMock(),
             edit_global_command=AsyncMock(),
             delete_global_command=AsyncMock(),
@@ -124,9 +131,24 @@ class SlowSyncTree(FakeTree):
 
 
 class SlowSyncBot(FakeBot):
-    def __init__(self, *, intents, proxy=None):
-        super().__init__(intents=intents, proxy=proxy)
+    def __init__(self, *, intents, proxy=None, connector=None, allowed_mentions=None, **_):
+        super().__init__(
+            intents=intents,
+            proxy=proxy,
+            connector=connector,
+            allowed_mentions=allowed_mentions,
+        )
         self.tree = SlowSyncTree()
+
+
+def _diagnostic_payloads(caplog):
+    payloads = []
+    for record in caplog.records:
+        marker = "Discord diagnostic "
+        if marker not in record.message:
+            continue
+        payloads.append(json.loads(record.message.split(marker, 1)[1]))
+    return payloads
 
 
 @pytest.mark.asyncio
@@ -150,8 +172,13 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
 
     created = {}
 
-    def fake_bot_factory(*, command_prefix, intents, proxy=None, allowed_mentions=None, **_):
-        created["bot"] = FakeBot(intents=intents, allowed_mentions=allowed_mentions)
+    def fake_bot_factory(*, command_prefix, intents, proxy=None, connector=None, allowed_mentions=None, **_):
+        created["bot"] = FakeBot(
+            intents=intents,
+            proxy=proxy,
+            connector=connector,
+            allowed_mentions=allowed_mentions,
+        )
         return created["bot"]
 
     monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
@@ -189,6 +216,7 @@ async def test_connect_releases_token_lock_on_timeout(monkeypatch):
         lambda **kwargs: FakeBot(
             intents=kwargs["intents"],
             proxy=kwargs.get("proxy"),
+            connector=kwargs.get("connector"),
             allowed_mentions=kwargs.get("allowed_mentions"),
         ),
     )
@@ -219,8 +247,13 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
 
     created = {}
 
-    def fake_bot_factory(*, command_prefix, intents, proxy=None, allowed_mentions=None, **_):
-        bot = SlowSyncBot(intents=intents, proxy=proxy)
+    def fake_bot_factory(*, command_prefix, intents, proxy=None, connector=None, allowed_mentions=None, **_):
+        bot = SlowSyncBot(
+            intents=intents,
+            proxy=proxy,
+            connector=connector,
+            allowed_mentions=allowed_mentions,
+        )
         created["bot"] = bot
         return bot
 
@@ -258,6 +291,7 @@ async def test_connect_respects_slash_commands_opt_out(monkeypatch):
         lambda **kwargs: FakeBot(
             intents=kwargs["intents"],
             proxy=kwargs.get("proxy"),
+            connector=kwargs.get("connector"),
             allowed_mentions=kwargs.get("allowed_mentions"),
         ),
     )
@@ -269,6 +303,46 @@ async def test_connect_respects_slash_commands_opt_out(monkeypatch):
 
     assert ok is True
     register_mock.assert_not_called()
+
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_emits_warning_diagnostics_on_success(monkeypatch, caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+    monkeypatch.setattr(adapter, "_count_pending_tasks", lambda: 5)
+    monkeypatch.setenv("DISCORD_PROXY", "http://proxy.internal:8080")
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        lambda **kwargs: FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            connector=kwargs.get("connector"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.discord"):
+        ok = await adapter.connect()
+
+    assert ok is True
+    payloads = _diagnostic_payloads(caplog)
+    assert [payload["event"] for payload in payloads[:2]] == [
+        "discord_connect_attempt_start",
+        "discord_connect_attempt_success",
+    ]
+    assert payloads[0]["pending_task_count"] == 5
+    assert payloads[0]["proxy_url"] == "http://proxy.internal:8080"
+    assert payloads[0]["connector"]["type"] == "default"
+    assert payloads[1]["phase"] == "connect"
 
     await adapter.disconnect()
 
@@ -655,3 +729,87 @@ async def test_safe_sync_detects_contexts_drift():
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 77)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired)
+
+
+@pytest.mark.asyncio
+async def test_connect_emits_warning_diagnostics_on_timeout(monkeypatch, caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
+    monkeypatch.setattr(adapter, "_count_pending_tasks", lambda: 3)
+
+    intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
+    monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
+    monkeypatch.setattr(
+        discord_platform.commands,
+        "Bot",
+        lambda **kwargs: FakeBot(
+            intents=kwargs["intents"],
+            proxy=kwargs.get("proxy"),
+            connector=kwargs.get("connector"),
+            allowed_mentions=kwargs.get("allowed_mentions"),
+        ),
+    )
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError("connect hung")
+
+    monkeypatch.setattr(discord_platform.asyncio, "wait_for", fake_wait_for)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.discord"):
+        ok = await adapter.connect()
+
+    assert ok is False
+    failure = _diagnostic_payloads(caplog)[-1]
+    assert failure["event"] == "discord_connect_attempt_failure"
+    assert failure["exception"] == {
+        "type": "TimeoutError",
+        "message": "connect hung",
+    }
+    assert failure["pending_task_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_reconnect_emits_retry_failure_diagnostics(monkeypatch, caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._client = SimpleNamespace(
+        connector=None,
+        http=SimpleNamespace(_HTTPClient__session=None, timeout=None, connector=None),
+        close=AsyncMock(),
+        clear=MagicMock(),
+        start=AsyncMock(side_effect=lambda token: asyncio.Event().wait()),
+    )
+    adapter._ready_event = asyncio.Event()
+    adapter._count_pending_tasks = lambda: 7
+
+    async def initial_failure():
+        raise RuntimeError("gateway dropped")
+
+    adapter._bot_task = asyncio.create_task(initial_failure())
+    await asyncio.sleep(0)
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError("retry ready timeout")
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(discord_platform.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", fast_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.discord"):
+        await adapter._reconnect_watchdog()
+
+    events = [payload["event"] for payload in _diagnostic_payloads(caplog)]
+    assert events[:3] == [
+        "discord_reconnect_scheduled",
+        "discord_reconnect_attempt_start",
+        "discord_reconnect_failure",
+    ]
+    failure = _diagnostic_payloads(caplog)[2]
+    assert failure["attempt"] == 1
+    assert failure["max_attempts"] == 20
+    assert failure["exception"]["type"] == "TimeoutError"

@@ -77,6 +77,7 @@ class DeliveryTarget:
     platform: Platform
     chat_id: Optional[str] = None  # None means use home channel
     thread_id: Optional[str] = None
+    account_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
     
@@ -100,6 +101,7 @@ class DeliveryTarget:
                     platform=origin.platform,
                     chat_id=origin.chat_id,
                     thread_id=origin.thread_id,
+                    account_id=origin.account_id,
                     is_origin=True,
                 )
             else:
@@ -109,16 +111,27 @@ class DeliveryTarget:
         if target_lower == "local":
             return cls(platform=Platform.LOCAL)
         
-        # Check for platform:chat_id or platform:chat_id:thread_id format
+        # Check for platform[/account_id]:chat_id or
+        # platform[/account_id]:chat_id:thread_id format.
         # Use the original case for chat_id/thread_id to preserve case-sensitive IDs
         if ":" in target_stripped:
             parts = target_stripped.split(":", 2)
-            platform_str = parts[0].lower()  # Platform names are case-insensitive
+            platform_str = parts[0]
             chat_id = parts[1] if len(parts) > 1 else None
             thread_id = parts[2] if len(parts) > 2 else None
+            account_id = None
+            if "/" in platform_str:
+                platform_str, account_id = platform_str.split("/", 1)
+            platform_str = platform_str.lower()
             try:
                 platform = Platform(platform_str)
-                return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
+                return cls(
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    account_id=account_id or None,
+                    is_explicit=True,
+                )
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
@@ -137,11 +150,14 @@ class DeliveryTarget:
             return "origin"
         if self.platform == Platform.LOCAL:
             return "local"
+        platform_value = self.platform.value
+        if self.account_id:
+            platform_value = f"{platform_value}/{self.account_id}"
         if self.chat_id and self.thread_id:
-            return f"{self.platform.value}:{self.chat_id}:{self.thread_id}"
+            return f"{platform_value}:{self.chat_id}:{self.thread_id}"
         if self.chat_id:
-            return f"{self.platform.value}:{self.chat_id}"
-        return self.platform.value
+            return f"{platform_value}:{self.chat_id}"
+        return platform_value
 
 
 class DeliveryRouter:
@@ -287,6 +303,9 @@ class DeliveryRouter:
             )
         
         send_metadata = dict(metadata or {})
+        if target.account_id and "account_id" not in send_metadata:
+            send_metadata["account_id"] = target.account_id
+
         is_named_telegram_private_topic = False
         named_telegram_private_topic_name: Optional[str] = None
         if target.thread_id:
@@ -366,7 +385,3 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
-
-

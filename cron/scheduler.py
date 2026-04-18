@@ -385,54 +385,78 @@ def _iter_home_target_platforms():
 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
+    from gateway.config import parse_weixin_home_channel
 
     origin = _resolve_origin(job)
+
+    def _with_optional_account_id(payload: dict, account_id: str | None) -> dict:
+        if account_id:
+            payload["account_id"] = account_id
+        return payload
 
     if deliver_value == "local":
         return None
 
     if deliver_value == "origin":
         if origin:
-            return {
+            return _with_optional_account_id({
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": origin.get("thread_id"),
-            }
+            }, origin.get("account_id"))
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
             chat_id = _get_home_target_chat_id(platform_name)
             if chat_id:
+                account_id = None
+                if platform_name == "weixin":
+                    chat_id, account_id = parse_weixin_home_channel(chat_id)
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
                     job.get("name", job.get("id", "?")),
                     platform_name,
                 )
-                return {
+                return _with_optional_account_id({
                     "platform": platform_name,
                     "chat_id": chat_id,
                     "thread_id": _get_home_target_thread_id(platform_name),
-                }
+                }, account_id)
         return None
 
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
+        account_id = None
+        if "/" in platform_name:
+            platform_key, account_id = platform_name.split("/", 1)
+            platform_key = platform_key.lower()
+            account_id = account_id.strip() or None
 
         from tools.send_message_tool import _parse_target_ref
 
         parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
+        if platform_key == "weixin" and parsed_chat_id:
+            parsed_chat_id, parsed_account_id = parse_weixin_home_channel(parsed_chat_id)
+            account_id = account_id or parsed_account_id
         if is_explicit:
             chat_id, thread_id = parsed_chat_id, parsed_thread_id
         else:
             chat_id, thread_id = rest, None
+            if platform_key == "weixin":
+                chat_id, parsed_account_id = parse_weixin_home_channel(chat_id)
+                account_id = account_id or parsed_account_id
 
         # Resolve human-friendly labels like "Alice (dm)" to real IDs.
         try:
             from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_key, chat_id)
+            directory_platform = f"{platform_key}/{account_id}" if account_id else platform_key
+            resolved = resolve_channel_name(directory_platform, chat_id)
             if resolved:
                 parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+                if platform_key == "weixin" and parsed_chat_id:
+                    parsed_chat_id, parsed_account_id = parse_weixin_home_channel(parsed_chat_id)
+                    account_id = account_id or parsed_account_id
                 if resolved_is_explicit:
                     chat_id = parsed_chat_id
                     if parsed_thread_id is not None:
@@ -442,31 +466,34 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         except Exception:
             pass
 
-        return {
-            "platform": platform_name,
+        return _with_optional_account_id({
+            "platform": platform_key,
             "chat_id": chat_id,
             "thread_id": thread_id,
-        }
+        }, account_id)
 
     platform_name = deliver_value
     if origin and origin.get("platform") == platform_name:
-        return {
+        return _with_optional_account_id({
             "platform": platform_name,
             "chat_id": str(origin["chat_id"]),
             "thread_id": origin.get("thread_id"),
-        }
+        }, origin.get("account_id"))
 
     if not _is_known_delivery_platform(platform_name):
         return None
     chat_id = _get_home_target_chat_id(platform_name)
     if not chat_id:
         return None
+    account_id = None
+    if platform_name.lower() == "weixin":
+        chat_id, account_id = parse_weixin_home_channel(chat_id)
 
-    return {
+    return _with_optional_account_id({
         "platform": platform_name,
         "chat_id": chat_id,
         "thread_id": _get_home_target_thread_id(platform_name),
-    }
+    }, account_id)
 
 
 def _normalize_deliver_value(deliver) -> str:
@@ -540,7 +567,12 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     for part in parts:
         target = _resolve_single_delivery_target(job, part)
         if target:
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            key = (
+                target["platform"].lower(),
+                target.get("account_id"),
+                str(target["chat_id"]),
+                target.get("thread_id"),
+            )
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
@@ -678,6 +710,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        account_id = target.get("account_id")
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -716,7 +749,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = {}
+            if thread_id:
+                send_metadata["thread_id"] = thread_id
+            if account_id:
+                send_metadata["account_id"] = account_id
+            if not send_metadata:
+                send_metadata = None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -779,7 +818,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                account_id=account_id,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -789,7 +836,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(
+                        asyncio.run,
+                        _send_to_platform(
+                            platform,
+                            pconfig,
+                            chat_id,
+                            cleaned_delivery_content,
+                            thread_id=thread_id,
+                            media_files=media_files,
+                            account_id=account_id,
+                        ),
+                    )
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
@@ -1430,11 +1488,13 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         platform="",
         chat_id="",
         chat_name="",
+        account_id="",
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
@@ -1482,6 +1542,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
             )
+            if delivery_target.get("account_id"):
+                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID"].set(str(delivery_target["account_id"]))
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 

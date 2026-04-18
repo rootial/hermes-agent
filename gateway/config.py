@@ -213,12 +213,14 @@ class HomeChannel:
     chat_id: str
     name: str  # Human-readable name for display
     thread_id: Optional[str] = None
+    account_id: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "name": self.name,
+            **({"account_id": self.account_id} if self.account_id else {}),
         }
         if self.thread_id:
             result["thread_id"] = self.thread_id
@@ -231,6 +233,7 @@ class HomeChannel:
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            account_id=str(data.get("account_id") or "").strip() or None,
         )
 
 
@@ -407,6 +410,21 @@ class StreamingConfig:
         )
 
 
+def parse_weixin_home_channel(value: str) -> tuple[str, Optional[str]]:
+    """Parse ``WEIXIN_HOME_CHANNEL`` values into ``(chat_id, account_id)``."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", None
+    if ":" not in raw:
+        return raw, None
+    account_id, chat_id = raw.split(":", 1)
+    account_id = account_id.strip()
+    chat_id = chat_id.strip()
+    if account_id and chat_id:
+        return chat_id, account_id
+    return raw, None
+
+
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
@@ -415,9 +433,6 @@ class StreamingConfig:
 # that rely on the generic ``token or api_key`` check (Telegram, Discord,
 # Slack, Matrix, Mattermost, HomeAssistant) do not need an entry here.
 _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
-    Platform.WEIXIN: lambda cfg: bool(
-        cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
-    ),
     Platform.WHATSAPP: lambda cfg: True,  # bridge handles auth
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
@@ -510,10 +525,20 @@ class GatewayConfig:
         # Weixin requires both a token and an account_id (checked first so
         # the generic token branch doesn't let it through without account_id).
         if platform == Platform.WEIXIN:
-            return bool(
-                config.extra.get("account_id")
-                and (config.token or config.extra.get("token"))
-            )
+            accounts = config.extra.get("accounts")
+            if config.extra.get("account_id") and (config.token or config.extra.get("token")):
+                return True
+            if isinstance(accounts, list):
+                return any(
+                    isinstance(account, dict)
+                    and str(account.get("account_id") or "").strip()
+                    and (
+                        str(account.get("token") or "").strip()
+                        or str(account.get("token_env") or "").strip()
+                    )
+                    for account in accounts
+                )
+            return False
 
         # Generic token/api_key auth covers Telegram, Discord, Slack, etc.
         if config.token or config.api_key:
@@ -812,6 +837,29 @@ def load_gateway_config() -> GatewayConfig:
                 platform_cfg = yaml_cfg.get(plat.value)
                 if not isinstance(platform_cfg, dict):
                     continue
+                plat_data = platforms_data.setdefault(plat.value, {})
+                if not isinstance(plat_data, dict):
+                    plat_data = {}
+                    platforms_data[plat.value] = plat_data
+
+                merged_platform_cfg = {
+                    key: platform_cfg[key]
+                    for key in ("enabled", "token", "api_key", "home_channel", "reply_to_mode")
+                    if key in platform_cfg
+                }
+                if isinstance(merged_platform_cfg.get("home_channel"), dict):
+                    merged_platform_cfg["home_channel"] = {
+                        "platform": plat.value,
+                        **merged_platform_cfg["home_channel"],
+                    }
+                if merged_platform_cfg:
+                    merged_platform_cfg["extra"] = {
+                        **plat_data.get("extra", {}),
+                        **platform_cfg.get("extra", {}),
+                    }
+                    platforms_data[plat.value] = {**plat_data, **merged_platform_cfg}
+                    plat_data = platforms_data[plat.value]
+
                 # Collect bridgeable keys from this platform section
                 bridged = {}
                 if "unauthorized_dm_behavior" in platform_cfg:
@@ -1659,13 +1707,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         weixin_split_multiline = os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES", "").strip()
         if weixin_split_multiline:
             extra["split_multiline_messages"] = weixin_split_multiline
+    if Platform.WEIXIN in config.platforms:
         weixin_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
         if weixin_home:
+            weixin_home_chat_id, weixin_home_account_id = parse_weixin_home_channel(weixin_home)
             config.platforms[Platform.WEIXIN].home_channel = HomeChannel(
                 platform=Platform.WEIXIN,
-                chat_id=weixin_home,
+                chat_id=weixin_home_chat_id,
                 name=os.getenv("WEIXIN_HOME_CHANNEL_NAME", "Home"),
                 thread_id=os.getenv("WEIXIN_HOME_CHANNEL_THREAD_ID") or None,
+                account_id=weixin_home_account_id,
             )
 
     # BlueBubbles (iMessage)

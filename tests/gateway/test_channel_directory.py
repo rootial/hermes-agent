@@ -173,6 +173,27 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
 
+    def test_weixin_account_qualified_match_filters_entries(self, tmp_path):
+        platforms = {
+            "weixin": [
+                {"id": "wxid_shared", "name": "Alice", "type": "dm", "account_id": "bot-a@im.bot"},
+                {"id": "wxid_shared", "name": "Alice", "type": "dm", "account_id": "bot-b@im.bot"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("weixin/bot-a@im.bot", "Alice (dm)") == "wxid_shared"
+            assert resolve_channel_name("weixin/bot-c@im.bot", "Alice (dm)") is None
+
+    def test_weixin_unqualified_match_requires_unique_entry(self, tmp_path):
+        platforms = {
+            "weixin": [
+                {"id": "wxid_a", "name": "Alice", "type": "dm", "account_id": "bot-a@im.bot"},
+                {"id": "wxid_b", "name": "Alice", "type": "dm", "account_id": "bot-b@im.bot"},
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("weixin", "Alice (dm)") is None
+
 
 class TestBuildFromSessions:
     def _write_sessions(self, tmp_path, sessions_data):
@@ -267,6 +288,34 @@ class TestBuildFromSessions:
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
 
+    def test_keeps_distinct_weixin_accounts_with_same_chat_id(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "bot_a": {
+                "origin": {
+                    "platform": "weixin",
+                    "account_id": "bot-a@im.bot",
+                    "chat_id": "wxid_same",
+                    "chat_name": "Alice",
+                },
+                "chat_type": "dm",
+            },
+            "bot_b": {
+                "origin": {
+                    "platform": "weixin",
+                    "account_id": "bot-b@im.bot",
+                    "chat_id": "wxid_same",
+                    "chat_name": "Alice",
+                },
+                "chat_type": "dm",
+            },
+        })
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("weixin")
+
+        assert len(entries) == 2
+        assert {entry["account_id"] for entry in entries} == {"bot-a@im.bot", "bot-b@im.bot"}
+
 
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):
@@ -304,6 +353,19 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server1):" in result
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
+
+    def test_weixin_display_includes_account_qualified_targets(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "weixin": [
+                {"id": "wxid_1", "name": "Alice", "type": "dm", "account_id": "bot-a@im.bot"},
+                {"id": "wxid_2", "name": "Ops", "type": "group", "account_id": "bot-b@im.bot"},
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        assert "weixin/bot-a@im.bot:Alice (dm)" in result
+        assert "weixin/bot-b@im.bot:Ops (group)" in result
 
 
 class TestLookupChannelType:

@@ -304,6 +304,7 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "account_id": get_session_env("HERMES_SESSION_ACCOUNT_ID") or None,
         }
     return None
 

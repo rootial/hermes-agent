@@ -175,6 +175,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # @deprecated legacy alias for scope_id (D-Q2.5)
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    account_id: Optional[str] = None  # Platform account/bot identity for multi-account adapters
     role_authorized: bool = False  # True when adapter granted access via role (not user ID)
     # Profile this inbound message is routed to in a multiplexing gateway
     # (from the /p/<profile>/ URL prefix or per-credential adapter ownership).
@@ -212,7 +213,6 @@ class SessionSource:
             self.scope_id = self.guild_id
         elif self.scope_id is not None:
             self.guild_id = self.scope_id
-
     @property
     def description(self) -> str:
         """Human-readable description of the source."""
@@ -245,6 +245,8 @@ class SessionSource:
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
         }
+        if self.account_id:
+            d["account_id"] = self.account_id
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
         if self.chat_id_alt:
@@ -290,6 +292,7 @@ class SessionSource:
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
+            account_id=data.get("account_id"),
         )
     
 
@@ -904,6 +907,7 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    account_prefix = f":{source.account_id}" if source.account_id else ""
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -911,8 +915,8 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_chat_id}"
+                return f"{ns}:{platform}{account_prefix}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{ns}:{platform}{account_prefix}:dm:{dm_chat_id}"
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -927,11 +931,11 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_participant_id}"
+                return f"{ns}:{platform}{account_prefix}:dm:{dm_participant_id}:{source.thread_id}"
+            return f"{ns}:{platform}{account_prefix}:dm:{dm_participant_id}"
         if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
-        return f"{ns}:{platform}:dm"
+            return f"{ns}:{platform}{account_prefix}:dm:{source.thread_id}"
+        return f"{ns}:{platform}{account_prefix}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -939,7 +943,10 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = [ns, platform, source.chat_type]
+    key_parts = [ns, platform]
+    if source.account_id:
+        key_parts.append(source.account_id)
+    key_parts.append(source.chat_type)
 
     if source.chat_id:
         key_parts.append(source.chat_id)

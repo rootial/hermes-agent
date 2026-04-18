@@ -3211,7 +3211,7 @@ def _setup_weixin():
     print()
     print_info("  1. Hermes will open Tencent iLink QR login in this terminal.")
     print_info("  2. Use WeChat to scan and confirm the QR code.")
-    print_info("  3. Hermes will store the returned account_id/token in ~/.hermes/.env.")
+    print_info("  3. Hermes will store per-account credentials under ~/.hermes/weixin/accounts/.")
     print_info("  4. This adapter supports native text, image, video, and document delivery.")
 
     existing_account = get_env_value("WEIXIN_ACCOUNT_ID")
@@ -3223,7 +3223,12 @@ def _setup_weixin():
             return
 
     try:
-        from gateway.platforms.weixin import check_weixin_requirements, qr_login
+        from gateway.platforms.weixin import (
+            check_weixin_requirements,
+            load_indexed_weixin_account_ids,
+            qr_login,
+            register_weixin_account_id,
+        )
     except Exception as exc:
         print_error(f"  Weixin adapter import failed: {exc}")
         print_info("  Install gateway dependencies first, then retry.")
@@ -3233,6 +3238,9 @@ def _setup_weixin():
         print_error("  Missing dependencies: Weixin needs aiohttp and cryptography.")
         print_info("  Install them, then rerun `hermes gateway setup`.")
         return
+
+    hermes_home = str(get_hermes_home())
+    existing_indexed_account_ids = load_indexed_weixin_account_ids(hermes_home)
 
     print()
     if not prompt_yes_no("  Start QR login now?", True):
@@ -3259,10 +3267,16 @@ def _setup_weixin():
     base_url = credentials.get("base_url", "")
     user_id = credentials.get("user_id", "")
 
-    save_env_value("WEIXIN_ACCOUNT_ID", account_id)
-    save_env_value("WEIXIN_TOKEN", token)
-    if base_url:
-        save_env_value("WEIXIN_BASE_URL", base_url)
+    register_weixin_account_id(hermes_home, account_id)
+    write_legacy_env = not existing_indexed_account_ids and not get_env_value("WEIXIN_ACCOUNT_ID")
+    if write_legacy_env:
+        save_env_value("WEIXIN_ACCOUNT_ID", account_id)
+        save_env_value("WEIXIN_TOKEN", token)
+        if base_url:
+            save_env_value("WEIXIN_BASE_URL", base_url)
+    else:
+        print_info("  Existing Weixin credentials kept unchanged in ~/.hermes/.env.")
+        print_info("  New account was appended to ~/.hermes/weixin/accounts.json.")
     save_env_value("WEIXIN_CDN_BASE_URL", get_env_value("WEIXIN_CDN_BASE_URL") or "https://novac2c.cdn.weixin.qq.com/c2c")
 
     print()

@@ -26,6 +26,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -212,8 +213,52 @@ def _account_dir(hermes_home: str) -> Path:
     return path
 
 
+def _accounts_index_path(hermes_home: str) -> Path:
+    path = Path(hermes_home) / "weixin" / "accounts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _account_file(hermes_home: str, account_id: str) -> Path:
     return _account_dir(hermes_home) / f"{account_id}.json"
+
+
+def load_indexed_weixin_account_ids(hermes_home: str) -> List[str]:
+    """Return account IDs registered in ``weixin/accounts.json``."""
+    path = _accounts_index_path(hermes_home)
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Weixin account registry is not valid JSON: {path}") from exc
+    if not isinstance(payload, list):
+        raise ValueError(f"Weixin account registry must be a JSON array: {path}")
+    account_ids: List[str] = []
+    for raw_value in payload:
+        account_id = str(raw_value or "").strip()
+        if not account_id:
+            raise ValueError(f"Weixin account registry contains an empty account_id: {path}")
+        if account_id not in account_ids:
+            account_ids.append(account_id)
+    return account_ids
+
+
+def register_weixin_account_id(hermes_home: str, account_id: str) -> List[str]:
+    """Append ``account_id`` to the on-disk Weixin registry if needed."""
+    normalized = str(account_id or "").strip()
+    if not normalized:
+        raise ValueError("Weixin account_id must not be empty")
+    account_ids = load_indexed_weixin_account_ids(hermes_home)
+    if normalized not in account_ids:
+        account_ids.append(normalized)
+        path = _accounts_index_path(hermes_home)
+        atomic_json_write(path, account_ids)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    return account_ids
 
 
 def save_weixin_account(
@@ -318,6 +363,24 @@ class TypingTicketCache:
 
     def set(self, user_id: str, ticket: str) -> None:
         self._cache[user_id] = (ticket, time.time())
+
+
+@dataclass
+class _AccountState:
+    """Per-account runtime state for multi-account Weixin polling and send."""
+
+    account_id: str
+    token: str
+    base_url: str
+    cdn_base_url: str
+    home_channel: Optional[str]
+    dm_policy: str
+    group_policy: str
+    allow_from: List[str]
+    group_allow_from: List[str]
+    token_store: ContextTokenStore
+    typing_cache: TypingTicketCache
+    dedup: MessageDeduplicator
 
 
 def _cdn_download_url(cdn_base_url: str, encrypted_query_param: str) -> str:
@@ -1098,6 +1161,7 @@ async def qr_login(
                     base_url=base_url,
                     user_id=user_id,
                 )
+                register_weixin_account_id(hermes_home, account_id)
                 print(f"\n微信连接成功，account_id={account_id}")
                 return {
                     "account_id": account_id,
@@ -1125,15 +1189,11 @@ class WeixinAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         hermes_home = str(get_hermes_home())
         self._hermes_home = hermes_home
-        self._token_store = ContextTokenStore(hermes_home)
-        self._typing_cache = TypingTicketCache()
         self._poll_session: Optional[aiohttp.ClientSession] = None
         self._send_session: Optional[aiohttp.ClientSession] = None
-        self._poll_task: Optional[asyncio.Task] = None
-        self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        self._poll_tasks: Dict[str, asyncio.Task] = {}
+        self._default_token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
 
-        self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-        self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
         self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
         self._cdn_base_url = str(
             extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
@@ -1163,12 +1223,180 @@ class WeixinAdapter(BasePlatformAdapter):
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
+        self._accounts = self._load_accounts(extra)
+        self._accounts_by_id = {state.account_id: state for state in self._accounts}
+        self._account_id = self._accounts[0].account_id if self._accounts else ""
+        self._token = self._accounts[0].token if self._accounts else ""
+        self._token_store = self._accounts[0].token_store if self._accounts else ContextTokenStore(hermes_home)
+        self._typing_cache = self._accounts[0].typing_cache if self._accounts else TypingTicketCache()
+        self._dedup = self._accounts[0].dedup if self._accounts else MessageDeduplicator(
+            ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS,
+        )
+        self._poll_task: Optional[asyncio.Task] = None
+        self._account_lock_ids: List[str] = []
 
-        if self._account_id and not self._token:
-            persisted = load_weixin_account(hermes_home, self._account_id)
+    def _load_accounts(self, extra: Dict[str, Any]) -> List[_AccountState]:
+        raw_accounts = extra.get("accounts")
+        indexed_account_ids = load_indexed_weixin_account_ids(self._hermes_home)
+        policy_overrides: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw_accounts, list) and raw_accounts:
+            for account_extra in raw_accounts:
+                if not isinstance(account_extra, dict):
+                    raise ValueError("platforms.weixin.extra.accounts entries must be objects")
+                account_id = str(account_extra.get("account_id") or "").strip()
+                if account_id:
+                    policy_overrides[account_id] = dict(account_extra)
+            if indexed_account_ids:
+                states: List[_AccountState] = []
+                for account_id in indexed_account_ids:
+                    merged_extra = {**extra, **policy_overrides.get(account_id, {}), "account_id": account_id}
+                    merged_extra.pop("accounts", None)
+                    states.append(
+                        self._build_account_state(
+                            merged_extra,
+                            allow_persisted_token=True,
+                            multi_account=True,
+                        )
+                    )
+                return states
+            states = []
+            for account_extra in raw_accounts:
+                states.append(
+                    self._build_account_state(
+                        account_extra,
+                        allow_persisted_token=True,
+                        multi_account=True,
+                    )
+                )
+            return states
+        if indexed_account_ids:
+            states = []
+            for account_id in indexed_account_ids:
+                merged_extra = {**extra, "account_id": account_id}
+                merged_extra.pop("accounts", None)
+                states.append(
+                    self._build_account_state(
+                        merged_extra,
+                        allow_persisted_token=True,
+                        multi_account=len(indexed_account_ids) > 1,
+                    )
+                )
+            return states
+        return [self._build_account_state(extra, allow_persisted_token=True, multi_account=False)]
+
+    def _build_account_state(
+        self,
+        account_extra: Dict[str, Any],
+        *,
+        allow_persisted_token: bool,
+        multi_account: bool,
+    ) -> _AccountState:
+        account_id = str(account_extra.get("account_id") or "").strip()
+        if not account_id and not multi_account:
+            account_id = str(os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
+        if multi_account and not account_id:
+            raise ValueError("Weixin multi-account mode requires account_id for each account")
+        token = self._resolve_account_token(account_extra, multi_account=multi_account)
+        base_url = str(account_extra.get("base_url") or self._base_url or ILINK_BASE_URL).strip().rstrip("/")
+        cdn_base_url = str(
+            account_extra.get("cdn_base_url") or self._cdn_base_url or WEIXIN_CDN_BASE_URL
+        ).strip().rstrip("/")
+        if account_id and not token and allow_persisted_token:
+            persisted = load_weixin_account(self._hermes_home, account_id)
             if persisted:
-                self._token = str(persisted.get("token") or "").strip()
-                self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
+                token = str(persisted.get("token") or "").strip()
+                base_url = str(persisted.get("base_url") or base_url).strip().rstrip("/")
+        return _AccountState(
+            account_id=account_id,
+            token=token,
+            base_url=base_url,
+            cdn_base_url=cdn_base_url,
+            home_channel=str(account_extra.get("home_channel") or "").strip() or None,
+            dm_policy=str(account_extra.get("dm_policy") or self._dm_policy).strip().lower(),
+            group_policy=str(account_extra.get("group_policy") or self._group_policy).strip().lower(),
+            allow_from=self._coerce_list(account_extra.get("allow_from", self._allow_from)),
+            group_allow_from=self._coerce_list(account_extra.get("group_allow_from", self._group_allow_from)),
+            token_store=ContextTokenStore(self._hermes_home),
+            typing_cache=TypingTicketCache(),
+            dedup=MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS),
+        )
+
+    def _resolve_account_token(self, account_extra: Dict[str, Any], *, multi_account: bool) -> str:
+        token_env = str(account_extra.get("token_env") or "").strip()
+        if token_env:
+            return str(os.getenv(token_env, "")).strip()
+        if multi_account:
+            return str(account_extra.get("token") or "").strip()
+        return str(account_extra.get("token") or self._default_token or os.getenv("WEIXIN_TOKEN", "")).strip()
+
+    def _resolve_account_state(
+        self,
+        *,
+        account_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> _AccountState:
+        requested_account_id = str(account_id or (metadata or {}).get("account_id") or "").strip()
+        if requested_account_id:
+            state = self._accounts_by_id.get(requested_account_id)
+            if not state:
+                raise ValueError(f"Unknown Weixin account_id: {requested_account_id}")
+            return state
+        if chat_id:
+            matched_states = [
+                state for state in self._accounts
+                if state.token_store.get(state.account_id, chat_id)
+            ]
+            if len(matched_states) == 1:
+                return matched_states[0]
+            if len(matched_states) > 1:
+                raise ValueError(
+                    f"Ambiguous Weixin account for chat_id {chat_id}: matched {len(matched_states)} accounts"
+                )
+        if not self._accounts:
+            raise ValueError("No Weixin accounts configured")
+        return self._accounts[0]
+
+    def _acquire_account_locks(self) -> bool:
+        from gateway.status import acquire_scoped_lock, release_scoped_lock
+
+        self._account_lock_ids = []
+        for state in self._accounts:
+            identity = state.account_id
+            acquired, existing = acquire_scoped_lock(
+                "weixin-bot-account",
+                identity,
+                metadata={"platform": self.platform.value, "account_id": state.account_id},
+            )
+            if acquired:
+                self._account_lock_ids.append(identity)
+                continue
+
+            owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+            message = (
+                f"Weixin account {state.account_id} already in use"
+                + (f" (PID {owner_pid})" if owner_pid else "")
+                + ". Stop the other gateway first."
+            )
+            logger.error("[%s] %s", self.name, message)
+            self._set_fatal_error("weixin_account_lock", message, retryable=False)
+            for held_identity in self._account_lock_ids:
+                release_scoped_lock("weixin-bot-account", held_identity)
+            self._account_lock_ids = []
+            return False
+        return True
+
+    def _release_account_locks(self) -> None:
+        if not self._account_lock_ids:
+            return
+        from gateway.status import release_scoped_lock
+
+        for identity in self._account_lock_ids:
+            try:
+                release_scoped_lock("weixin-bot-account", identity)
+            except Exception:
+                logger.debug("[%s] failed to release Weixin account lock for %s", self.name, identity, exc_info=True)
+        self._account_lock_ids = []
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -1186,41 +1414,61 @@ class WeixinAdapter(BasePlatformAdapter):
             self._set_fatal_error("weixin_missing_dependency", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
-        if not self._token:
-            message = "Weixin startup failed: WEIXIN_TOKEN is required"
+        if not self._accounts:
+            message = "Weixin startup failed: at least one Weixin account is required"
+            self._set_fatal_error("weixin_missing_account", message, retryable=False)
+            logger.warning("[%s] %s", self.name, message)
+            return False
+        missing_tokens = [state.account_id or "<missing-account-id>" for state in self._accounts if not state.token]
+        if missing_tokens:
+            message = "Weixin startup failed: missing token for configured account(s): " + ", ".join(missing_tokens)
             self._set_fatal_error("weixin_missing_token", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
-        if not self._account_id:
-            message = "Weixin startup failed: WEIXIN_ACCOUNT_ID is required"
+        if any(not state.account_id for state in self._accounts):
+            message = "Weixin startup failed: each configured Weixin account needs account_id"
             self._set_fatal_error("weixin_missing_account", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
 
         try:
-            if not self._acquire_platform_lock('weixin-bot-token', self._token, 'Weixin bot token'):
+            if not self._acquire_account_locks():
                 return False
         except Exception as exc:
-            logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
+            logger.debug("[%s] Account lock unavailable (non-fatal): %s", self.name, exc)
 
         self._poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
         self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-        self._token_store.restore(self._account_id)
-        self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
+        self._poll_tasks = {}
+        for idx, state in enumerate(self._accounts):
+            state.token_store.restore(state.account_id)
+            _LIVE_ADAPTERS[state.token] = self
+            task = asyncio.create_task(
+                self._poll_loop(state, startup_delay_seconds=idx * 5.0),
+                name=f"weixin-poll:{state.account_id}",
+            )
+            self._poll_tasks[state.account_id] = task
+        self._poll_task = next(iter(self._poll_tasks.values()), None)
         self._mark_connected()
-        _LIVE_ADAPTERS[self._token] = self
-        logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
+        logger.info("[%s] Connected %d Weixin account(s)", self.name, len(self._accounts))
         return True
 
     async def disconnect(self) -> None:
-        _LIVE_ADAPTERS.pop(self._token, None)
+        for state in self._accounts:
+            _LIVE_ADAPTERS.pop(state.token, None)
         self._running = False
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
+        tasks = list(self._poll_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
             try:
-                await self._poll_task
+                await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.debug("[%s] poll task ended with error during disconnect", self.name, exc_info=True)
+        self._poll_tasks = {}
         self._poll_task = None
         if self._poll_session and not self._poll_session.closed:
             await self._poll_session.close()
@@ -1228,13 +1476,15 @@ class WeixinAdapter(BasePlatformAdapter):
         if self._send_session and not self._send_session.closed:
             await self._send_session.close()
         self._send_session = None
-        self._release_platform_lock()
+        self._release_account_locks()
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
-    async def _poll_loop(self) -> None:
+    async def _poll_loop(self, state: _AccountState, *, startup_delay_seconds: float = 0.0) -> None:
         assert self._poll_session is not None
-        sync_buf = _load_sync_buf(self._hermes_home, self._account_id)
+        if startup_delay_seconds > 0:
+            await asyncio.sleep(startup_delay_seconds)
+        sync_buf = _load_sync_buf(self._hermes_home, state.account_id)
         timeout_ms = LONG_POLL_TIMEOUT_MS
         consecutive_failures = 0
 
@@ -1242,8 +1492,8 @@ class WeixinAdapter(BasePlatformAdapter):
             try:
                 response = await _get_updates(
                     self._poll_session,
-                    base_url=self._base_url,
-                    token=self._token,
+                    base_url=state.base_url,
+                    token=state.token,
                     sync_buf=sync_buf,
                     timeout_ms=timeout_ms,
                 )
@@ -1255,7 +1505,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 errcode = response.get("errcode", 0)
                 if ret not in (0, None) or errcode not in (0, None):
                     if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
-                        logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
+                        logger.error("[%s] Session expired for %s; pausing for 10 minutes", self.name, _safe_id(state.account_id))
                         await asyncio.sleep(600)
                         consecutive_failures = 0
                         continue
@@ -1278,50 +1528,57 @@ class WeixinAdapter(BasePlatformAdapter):
                 new_sync_buf = str(response.get("get_updates_buf") or "")
                 if new_sync_buf:
                     sync_buf = new_sync_buf
-                    _save_sync_buf(self._hermes_home, self._account_id, sync_buf)
+                    _save_sync_buf(self._hermes_home, state.account_id, sync_buf)
 
                 for message in response.get("msgs") or []:
-                    asyncio.create_task(self._process_message_safe(message))
+                    await self._process_message_safe(message, state)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 consecutive_failures += 1
-                logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
+                logger.error(
+                    "[%s] poll error account=%s (%d/%d): %s",
+                    self.name,
+                    _safe_id(state.account_id),
+                    consecutive_failures,
+                    MAX_CONSECUTIVE_FAILURES,
+                    exc,
+                )
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
 
-    async def _process_message_safe(self, message: Dict[str, Any]) -> None:
+    async def _process_message_safe(self, message: Dict[str, Any], state: _AccountState) -> None:
         try:
-            await self._process_message(message)
+            await self._process_message(message, state)
         except Exception as exc:
             logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
 
-    async def _process_message(self, message: Dict[str, Any]) -> None:
+    async def _process_message(self, message: Dict[str, Any], state: _AccountState) -> None:
         assert self._poll_session is not None
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id:
             return
-        if sender_id == self._account_id:
+        if sender_id == state.account_id:
             return
 
         message_id = str(message.get("message_id") or "").strip()
-        if message_id and self._dedup.is_duplicate(message_id):
+        if message_id and state.dedup.is_duplicate(message_id):
             return
 
-        chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
+        chat_type, effective_chat_id = _guess_chat_type(message, state.account_id)
         if chat_type == "group":
-            if self._group_policy == "disabled":
+            if state.group_policy == "disabled":
                 return
-            if self._group_policy == "allowlist" and effective_chat_id not in self._group_allow_from:
+            if state.group_policy == "allowlist" and effective_chat_id not in state.group_allow_from:
                 return
-        elif not self._is_dm_allowed(sender_id):
+        elif not self._is_dm_allowed(sender_id, state):
             return
 
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
-            self._token_store.set(self._account_id, sender_id, context_token)
-        asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+            state.token_store.set(state.account_id, sender_id, context_token)
+        asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None, state))
 
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)
@@ -1329,11 +1586,11 @@ class WeixinAdapter(BasePlatformAdapter):
         media_types: List[str] = []
 
         for item in item_list:
-            await self._collect_media(item, media_paths, media_types)
+            await self._collect_media(item, media_paths, media_types, state)
             ref_message = item.get("ref_msg") or {}
             ref_item = ref_message.get("message_item")
             if isinstance(ref_item, dict):
-                await self._collect_media(ref_item, media_paths, media_types)
+                await self._collect_media(ref_item, media_paths, media_types, state)
 
         if not text and not media_paths:
             return
@@ -1343,6 +1600,7 @@ class WeixinAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_id,
+            account_id=state.account_id,
         )
         event = MessageEvent(
             text=text,
@@ -1357,42 +1615,48 @@ class WeixinAdapter(BasePlatformAdapter):
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
         await self.handle_message(event)
 
-    def _is_dm_allowed(self, sender_id: str) -> bool:
-        if self._dm_policy == "disabled":
+    def _is_dm_allowed(self, sender_id: str, state: _AccountState) -> bool:
+        if state.dm_policy == "disabled":
             return False
-        if self._dm_policy == "allowlist":
-            return sender_id in self._allow_from
+        if state.dm_policy == "allowlist":
+            return sender_id in state.allow_from
         return True
 
-    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+    async def _collect_media(
+        self,
+        item: Dict[str, Any],
+        media_paths: List[str],
+        media_types: List[str],
+        state: _AccountState,
+    ) -> None:
         item_type = item.get("type")
         if item_type == ITEM_IMAGE:
-            path = await self._download_image(item)
+            path = await self._download_image(item, state)
             if path:
                 media_paths.append(path)
                 media_types.append("image/jpeg")
         elif item_type == ITEM_VIDEO:
-            path = await self._download_video(item)
+            path = await self._download_video(item, state)
             if path:
                 media_paths.append(path)
                 media_types.append("video/mp4")
         elif item_type == ITEM_FILE:
-            path, mime = await self._download_file(item)
+            path, mime = await self._download_file(item, state)
             if path:
                 media_paths.append(path)
                 media_types.append(mime)
         elif item_type == ITEM_VOICE:
-            voice_path = await self._download_voice(item)
+            voice_path = await self._download_voice(item, state)
             if voice_path:
                 media_paths.append(voice_path)
                 media_types.append("audio/silk")
 
-    async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
+    async def _download_image(self, item: Dict[str, Any], state: _AccountState) -> Optional[str]:
         media = _media_reference(item, "image_item")
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
-                cdn_base_url=self._cdn_base_url,
+                cdn_base_url=state.cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=(item.get("image_item") or {}).get("aeskey")
                 and base64.b64encode(bytes.fromhex(str((item.get("image_item") or {}).get("aeskey")))).decode("ascii")
@@ -1405,12 +1669,12 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] image download failed: %s", self.name, exc)
             return None
 
-    async def _download_video(self, item: Dict[str, Any]) -> Optional[str]:
+    async def _download_video(self, item: Dict[str, Any], state: _AccountState) -> Optional[str]:
         media = _media_reference(item, "video_item")
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
-                cdn_base_url=self._cdn_base_url,
+                cdn_base_url=state.cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
@@ -1421,7 +1685,7 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] video download failed: %s", self.name, exc)
             return None
 
-    async def _download_file(self, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    async def _download_file(self, item: Dict[str, Any], state: _AccountState) -> Tuple[Optional[str], str]:
         file_item = item.get("file_item") or {}
         media = file_item.get("media") or {}
         filename = str(file_item.get("file_name") or "document.bin")
@@ -1429,7 +1693,7 @@ class WeixinAdapter(BasePlatformAdapter):
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
-                cdn_base_url=self._cdn_base_url,
+                cdn_base_url=state.cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
@@ -1440,7 +1704,7 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] file download failed: %s", self.name, exc)
             return None, mime
 
-    async def _download_voice(self, item: Dict[str, Any]) -> Optional[str]:
+    async def _download_voice(self, item: Dict[str, Any], state: _AccountState) -> Optional[str]:
         voice_item = item.get("voice_item") or {}
         media = voice_item.get("media") or {}
         if voice_item.get("text"):
@@ -1448,7 +1712,7 @@ class WeixinAdapter(BasePlatformAdapter):
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
-                cdn_base_url=self._cdn_base_url,
+                cdn_base_url=state.cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
                 full_url=media.get("full_url"),
@@ -1459,22 +1723,27 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.warning("[%s] voice download failed: %s", self.name, exc)
             return None
 
-    async def _maybe_fetch_typing_ticket(self, user_id: str, context_token: Optional[str]) -> None:
-        if not self._poll_session or not self._token:
+    async def _maybe_fetch_typing_ticket(
+        self,
+        user_id: str,
+        context_token: Optional[str],
+        state: _AccountState,
+    ) -> None:
+        if not self._poll_session or not state.token:
             return
-        if self._typing_cache.get(user_id):
+        if state.typing_cache.get(user_id):
             return
         try:
             response = await _get_config(
                 self._poll_session,
-                base_url=self._base_url,
-                token=self._token,
+                base_url=state.base_url,
+                token=state.token,
                 user_id=user_id,
                 context_token=context_token,
             )
             typing_ticket = str(response.get("typing_ticket") or "")
             if typing_ticket:
-                self._typing_cache.set(user_id, typing_ticket)
+                state.typing_cache.set(user_id, typing_ticket)
         except Exception as exc:
             logger.debug("[%s] getConfig failed for %s: %s", self.name, _safe_id(user_id), exc)
 
@@ -1486,6 +1755,7 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _send_text_chunk(
         self,
         *,
+        state: _AccountState,
         chat_id: str,
         chunk: str,
         context_token: Optional[str],
@@ -1504,8 +1774,8 @@ class WeixinAdapter(BasePlatformAdapter):
             try:
                 resp = await _send_message(
                     self._send_session,
-                    base_url=self._base_url,
-                    token=self._token,
+                    base_url=state.base_url,
+                    token=state.token,
                     to=chat_id,
                     text=chunk,
                     context_token=context_token,
@@ -1524,8 +1794,8 @@ class WeixinAdapter(BasePlatformAdapter):
                         if is_session_expired and not retried_without_token and context_token:
                             retried_without_token = True
                             context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
+                            state.token_store._cache.pop(
+                                state.token_store._key(state.account_id, chat_id), None
                             )
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
@@ -1584,10 +1854,17 @@ class WeixinAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
     ) -> SendResult:
-        if not self._send_session or not self._token:
+        if not self._send_session:
             return SendResult(success=False, error="Not connected")
-        context_token = self._token_store.get(self._account_id, chat_id)
+        try:
+            state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+        if not state.token:
+            return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
+        context_token = state.token_store.get(state.account_id, chat_id)
         last_message_id: Optional[str] = None
 
         # Extract MEDIA: tags and bare local file paths before text delivery.
@@ -1602,13 +1879,13 @@ class WeixinAdapter(BasePlatformAdapter):
         async def _deliver_media(path: str, is_voice: bool = False) -> None:
             ext = Path(path).suffix.lower()
             if is_voice or ext in _AUDIO_EXTS:
-                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, account_id=state.account_id)
             elif ext in _VIDEO_EXTS:
-                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata, account_id=state.account_id)
             elif ext in _IMAGE_EXTS:
-                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata, account_id=state.account_id)
             else:
-                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata, account_id=state.account_id)
 
         try:
             # Deliver extracted MEDIA: attachments first.
@@ -1630,6 +1907,7 @@ class WeixinAdapter(BasePlatformAdapter):
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
                 await self._send_text_chunk(
+                    state=state,
                     chat_id=chat_id,
                     chunk=chunk,
                     context_token=context_token,
@@ -1644,16 +1922,20 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if not self._send_session or not self._token:
+        if not self._send_session:
             return
-        typing_ticket = self._typing_cache.get(chat_id)
+        try:
+            state = self._resolve_account_state(chat_id=chat_id, metadata=metadata)
+        except Exception:
+            return
+        typing_ticket = state.typing_cache.get(chat_id)
         if not typing_ticket:
             return
         try:
             await _send_typing(
                 self._send_session,
-                base_url=self._base_url,
-                token=self._token,
+                base_url=state.base_url,
+                token=state.token,
                 to_user_id=chat_id,
                 typing_ticket=typing_ticket,
                 status=TYPING_START,
@@ -1662,16 +1944,20 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), exc)
 
     async def stop_typing(self, chat_id: str) -> None:
-        if not self._send_session or not self._token:
+        if not self._send_session:
             return
-        typing_ticket = self._typing_cache.get(chat_id)
+        try:
+            state = self._resolve_account_state(chat_id=chat_id)
+        except Exception:
+            return
+        typing_ticket = state.typing_cache.get(chat_id)
         if not typing_ticket:
             return
         try:
             await _send_typing(
                 self._send_session,
-                base_url=self._base_url,
-                token=self._token,
+                base_url=state.base_url,
+                token=state.token,
                 to_user_id=chat_id,
                 typing_ticket=typing_ticket,
                 status=TYPING_STOP,
@@ -1686,6 +1972,7 @@ class WeixinAdapter(BasePlatformAdapter):
         caption: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
     ) -> SendResult:
         if image_url.startswith(("http://", "https://")):
             file_path = await self._download_remote_media(image_url)
@@ -1696,7 +1983,13 @@ class WeixinAdapter(BasePlatformAdapter):
                 file_path = os.path.abspath(file_path)
             cleanup = False
         try:
-            return await self.send_document(chat_id, file_path, caption=caption, metadata=metadata)
+            return await self.send_document(
+                chat_id,
+                file_path,
+                caption=caption,
+                metadata=metadata,
+                account_id=account_id,
+            )
         finally:
             if cleanup and file_path and os.path.exists(file_path):
                 try:
@@ -1711,6 +2004,7 @@ class WeixinAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
         del reply_to, kwargs
@@ -1719,6 +2013,7 @@ class WeixinAdapter(BasePlatformAdapter):
             file_path=image_path,
             caption=caption,
             metadata=metadata,
+            account_id=account_id,
         )
 
     async def send_document(
@@ -1729,13 +2024,17 @@ class WeixinAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        del file_name, reply_to, metadata, kwargs
-        if not self._send_session or not self._token:
+        del file_name, reply_to, kwargs
+        if not self._send_session:
             return SendResult(success=False, error="Not connected")
         try:
-            message_id = await self._send_file(chat_id, file_path, caption or "")
+            state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
+            if not state.token:
+                return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
+            message_id = await self._send_file(chat_id, file_path, caption or "", state)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
@@ -1748,11 +2047,15 @@ class WeixinAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
     ) -> SendResult:
-        if not self._send_session or not self._token:
+        if not self._send_session:
             return SendResult(success=False, error="Not connected")
         try:
-            message_id = await self._send_file(chat_id, video_path, caption or "")
+            state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
+            if not state.token:
+                return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
+            message_id = await self._send_file(chat_id, video_path, caption or "", state)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
@@ -1765,8 +2068,9 @@ class WeixinAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        account_id: Optional[str] = None,
     ) -> SendResult:
-        if not self._send_session or not self._token:
+        if not self._send_session:
             return SendResult(success=False, error="Not connected")
 
         # Native outbound Weixin voice bubbles are not proven-working in the
@@ -1774,10 +2078,14 @@ class WeixinAdapter(BasePlatformAdapter):
         # fallback so users at least receive playable audio, even for .silk.
         fallback_caption = caption or "[voice message as attachment]"
         try:
+            state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
+            if not state.token:
+                return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
             message_id = await self._send_file(
                 chat_id,
                 audio_path,
                 fallback_caption,
+                state,
                 force_file_attachment=True,
             )
             return SendResult(success=True, message_id=message_id)
@@ -1805,9 +2113,10 @@ class WeixinAdapter(BasePlatformAdapter):
         chat_id: str,
         path: str,
         caption: str,
+        state: _AccountState,
         force_file_attachment: bool = False,
     ) -> str:
-        assert self._send_session is not None and self._token is not None
+        assert self._send_session is not None and state.token is not None
         plaintext = Path(path).read_bytes()
         media_type, item_builder = self._outbound_media_builder(path, force_file_attachment=force_file_attachment)
         filekey = secrets.token_hex(16)
@@ -1816,8 +2125,8 @@ class WeixinAdapter(BasePlatformAdapter):
         rawfilemd5 = hashlib.md5(plaintext).hexdigest()
         upload_response = await _get_upload_url(
             self._send_session,
-            base_url=self._base_url,
-            token=self._token,
+            base_url=state.base_url,
+            token=state.token,
             to_user_id=chat_id,
             media_type=media_type,
             filekey=filekey,
@@ -1836,7 +2145,7 @@ class WeixinAdapter(BasePlatformAdapter):
         if upload_full_url:
             upload_url = upload_full_url
         elif upload_param:
-            upload_url = _cdn_upload_url(self._cdn_base_url, upload_param, filekey)
+            upload_url = _cdn_upload_url(state.cdn_base_url, upload_param, filekey)
         else:
             raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
 
@@ -1845,7 +2154,7 @@ class WeixinAdapter(BasePlatformAdapter):
             ciphertext=ciphertext,
             upload_url=upload_url,
         )
-        context_token = self._token_store.get(self._account_id, chat_id)
+        context_token = state.token_store.get(state.account_id, chat_id)
         # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
         # Sending base64(raw_bytes) causes images to show as grey boxes on the
         # receiver side because the decryption key doesn't match.
@@ -1869,8 +2178,8 @@ class WeixinAdapter(BasePlatformAdapter):
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
             await _send_message(
                 self._send_session,
-                base_url=self._base_url,
-                token=self._token,
+                base_url=state.base_url,
+                token=state.token,
                 to=chat_id,
                 text=self.format_message(caption),
                 context_token=context_token,
@@ -1880,7 +2189,7 @@ class WeixinAdapter(BasePlatformAdapter):
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
         await _api_post(
             self._send_session,
-            base_url=self._base_url,
+            base_url=state.base_url,
             endpoint=EP_SEND_MESSAGE,
             payload={
                 "msg": {
@@ -1893,7 +2202,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     **({"context_token": context_token} if context_token else {}),
                 }
             },
-            token=self._token,
+            token=state.token,
             timeout_ms=API_TIMEOUT_MS,
         )
         return last_message_id
@@ -1984,24 +2293,80 @@ async def send_weixin_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     One-shot send helper for ``send_message`` and cron delivery.
 
     This bypasses the long-poll adapter lifecycle and uses the raw API directly.
     """
-    account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-    base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
-    cdn_base_url = str(extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
-    resolved_token = str(token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+    hermes_home = str(get_hermes_home())
+    default_base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+    default_cdn_base_url = str(
+        extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+    ).strip().rstrip("/")
+    indexed_account_ids = load_indexed_weixin_account_ids(hermes_home)
+    requested_account_id = str(account_id or extra.get("account_id") or "").strip()
+    if not requested_account_id and not indexed_account_ids:
+        requested_account_id = str(os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
+
+    account_extra = dict(extra or {})
+    accounts = extra.get("accounts")
+    policy_overrides: Dict[str, Dict[str, Any]] = {}
+    if isinstance(accounts, list) and accounts:
+        for candidate in accounts:
+            if not isinstance(candidate, dict):
+                return {"error": "Weixin accounts config entries must be objects."}
+            candidate_id = str(candidate.get("account_id") or "").strip()
+            if candidate_id:
+                policy_overrides[candidate_id] = dict(candidate)
+
+    if indexed_account_ids:
+        if requested_account_id:
+            if requested_account_id not in indexed_account_ids:
+                return {"error": f"Weixin account ID not found in accounts.json: {requested_account_id}"}
+        elif len(indexed_account_ids) == 1:
+            requested_account_id = indexed_account_ids[0]
+        else:
+            return {"error": "Weixin account ID is required when multiple indexed accounts exist."}
+        account_extra = {**account_extra, **policy_overrides.get(requested_account_id, {}), "account_id": requested_account_id}
+    elif policy_overrides:
+        if requested_account_id:
+            if requested_account_id not in policy_overrides:
+                return {"error": f"Weixin account ID not found in config: {requested_account_id}"}
+            account_extra = {**account_extra, **policy_overrides[requested_account_id]}
+        else:
+            first_id = next(iter(policy_overrides.keys()), "")
+            if not first_id:
+                return {"error": "Weixin accounts config is empty or invalid."}
+            account_extra = {**account_extra, **policy_overrides[first_id]}
+            requested_account_id = first_id
+
+    resolved_account_id = str(requested_account_id or account_extra.get("account_id") or "").strip()
+    multi_account = bool(indexed_account_ids) or bool(policy_overrides)
+    token_env = str(account_extra.get("token_env") or "").strip()
+    persisted = load_weixin_account(hermes_home, resolved_account_id) if resolved_account_id else None
+    resolved_token = ""
+    if token_env:
+        resolved_token = str(os.getenv(token_env, "")).strip()
+    elif account_extra.get("token"):
+        resolved_token = str(account_extra.get("token") or "").strip()
+    elif persisted:
+        resolved_token = str(persisted.get("token") or "").strip()
+    elif not multi_account:
+        resolved_token = str(token or os.getenv("WEIXIN_TOKEN", "")).strip()
+    base_url = str(account_extra.get("base_url") or default_base_url).strip().rstrip("/")
+    if persisted:
+        base_url = str(persisted.get("base_url") or base_url).strip().rstrip("/")
+    cdn_base_url = str(account_extra.get("cdn_base_url") or default_cdn_base_url).strip().rstrip("/")
     if not resolved_token:
-        return {"error": "Weixin token missing. Configure WEIXIN_TOKEN or platforms.weixin.token."}
-    if not account_id:
+        return {"error": "Weixin token missing. Configure WEIXIN_TOKEN, token_env, or platforms.weixin.token."}
+    if not resolved_account_id:
         return {"error": "Weixin account ID missing. Configure WEIXIN_ACCOUNT_ID or platforms.weixin.extra.account_id."}
 
-    token_store = ContextTokenStore(str(get_hermes_home()))
-    token_store.restore(account_id)
-    context_token = token_store.get(account_id, chat_id)
+    token_store = ContextTokenStore(hermes_home)
+    token_store.restore(resolved_account_id)
+    context_token = token_store.get(resolved_account_id, chat_id)
 
     live_adapter = _LIVE_ADAPTERS.get(resolved_token)
     send_session = getattr(live_adapter, '_send_session', None)
@@ -2009,16 +2374,16 @@ async def send_weixin_direct(
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
         if cleaned:
-            last_result = await live_adapter.send(chat_id, cleaned)
+            last_result = await live_adapter.send(chat_id, cleaned, account_id=resolved_account_id)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
+                last_result = await live_adapter.send_image_file(chat_id, media_path, account_id=resolved_account_id)
             else:
-                last_result = await live_adapter.send_document(chat_id, media_path)
+                last_result = await live_adapter.send_document(chat_id, media_path, account_id=resolved_account_id)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
@@ -2028,6 +2393,7 @@ async def send_weixin_direct(
             "chat_id": chat_id,
             "message_id": last_result.message_id if last_result else None,
             "context_token_used": bool(context_token),
+            "account_id": resolved_account_id,
         }
 
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
@@ -2044,26 +2410,23 @@ async def send_weixin_direct(
             )
         )
         adapter._send_session = session
-        adapter._session = session
-        adapter._token = resolved_token
-        adapter._account_id = account_id
-        adapter._base_url = base_url
-        adapter._cdn_base_url = cdn_base_url
-        adapter._token_store = token_store
+        state = adapter._resolve_account_state(account_id=resolved_account_id)
+        state.token_store = token_store
+        adapter._accounts_by_id[resolved_account_id] = state
 
         last_result: Optional[SendResult] = None
         cleaned = adapter.format_message(message)
         if cleaned:
-            last_result = await adapter.send(chat_id, cleaned)
+            last_result = await adapter.send(chat_id, cleaned, account_id=resolved_account_id)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await adapter.send_image_file(chat_id, media_path)
+                last_result = await adapter.send_image_file(chat_id, media_path, account_id=resolved_account_id)
             else:
-                last_result = await adapter.send_document(chat_id, media_path)
+                last_result = await adapter.send_document(chat_id, media_path, account_id=resolved_account_id)
             if not last_result.success:
                 return {"error": f"Weixin media send failed: {last_result.error}"}
 
@@ -2073,4 +2436,5 @@ async def send_weixin_direct(
             "chat_id": chat_id,
             "message_id": last_result.message_id if last_result else None,
             "context_token_used": bool(context_token),
+            "account_id": resolved_account_id,
         }

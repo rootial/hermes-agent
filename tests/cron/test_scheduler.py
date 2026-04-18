@@ -245,6 +245,43 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_account_qualified_weixin_label_preserves_account_id(self):
+        job = {"deliver": "weixin/bot-b@im.bot:Alice (dm)"}
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="wxid_user",
+        ) as resolve_mock:
+            result = _resolve_delivery_target(job)
+        resolve_mock.assert_called_once_with("weixin/bot-b@im.bot", "Alice (dm)")
+        assert result == {
+            "platform": "weixin",
+            "chat_id": "wxid_user",
+            "thread_id": None,
+            "account_id": "bot-b@im.bot",
+        }
+
+    def test_bare_weixin_platform_parses_account_qualified_home_channel(self, monkeypatch):
+        monkeypatch.setenv("WEIXIN_HOME_CHANNEL", "bot-b@im.bot:wxid_home")
+        job = {"deliver": "weixin"}
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "weixin",
+            "chat_id": "wxid_home",
+            "thread_id": None,
+            "account_id": "bot-b@im.bot",
+        }
+
+    def test_origin_delivery_falls_back_to_weixin_home_channel(self, monkeypatch):
+        monkeypatch.setenv("WEIXIN_HOME_CHANNEL", "bot-b@im.bot:wxid_home")
+        job = {"deliver": "origin"}
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "weixin",
+            "chat_id": "wxid_home",
+            "thread_id": None,
+            "account_id": "bot-b@im.bot",
+        }
+
     def test_explicit_discord_topic_target_with_thread_id(self):
         """deliver: 'discord:chat_id:thread_id' parses correctly."""
         job = {

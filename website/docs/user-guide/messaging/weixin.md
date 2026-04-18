@@ -74,6 +74,12 @@ WEIXIN_HOME_CHANNEL=chat_id
 WEIXIN_HOME_CHANNEL_NAME=Home
 ```
 
+For multi-account setups, qualify the home channel with the bot account:
+
+```bash
+WEIXIN_HOME_CHANNEL=bot-b@im.bot:chat_id
+```
+
 ### 3. Start the Gateway
 
 ```bash
@@ -99,7 +105,7 @@ The adapter will restore saved credentials, connect to the iLink API, and begin 
 
 ## Configuration Options
 
-Set these in `config.yaml` under `platforms.weixin.extra`:
+Set these in `config.yaml` under `weixin.extra` or `platforms.weixin.extra`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -112,6 +118,26 @@ Set these in `config.yaml` under `platforms.weixin.extra`:
 | `allow_from` | `[]` | User IDs allowed for DMs (when dm_policy=allowlist) |
 | `group_allow_from` | `[]` | Group IDs allowed (when group_policy=allowlist) |
 | `split_multiline_messages` | `false` | When `true`, split multi-line replies into multiple chat messages (legacy behavior). When `false`, keep multi-line replies as one message unless they exceed the length limit. |
+
+For multi-account configs, replace the single-account fields with an `accounts` list:
+
+```yaml
+weixin:
+  enabled: true
+  home_channel:
+    chat_id: o9cq80-669z_lFBY7zypXWvuT05M@im.wechat
+    account_id: bot-a@im.bot
+    name: Home
+  extra:
+    base_url: https://ilinkai.weixin.qq.com
+    accounts:
+      - account_id: bot-a@im.bot
+        token_env: WEIXIN_TOKEN
+        home_channel: o9cq80-669z_lFBY7zypXWvuT05M@im.wechat
+      - account_id: bot-b@im.bot
+        token_env: WEIXIN_TOKEN_2
+        home_channel: wxid_ops
+```
 
 ## Access Policies
 

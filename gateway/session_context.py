@@ -54,6 +54,7 @@ _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
+_SESSION_ACCOUNT_ID: ContextVar = ContextVar("HERMES_SESSION_ACCOUNT_ID", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
@@ -61,6 +62,7 @@ _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+_CRON_AUTO_DELIVER_ACCOUNT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -69,10 +71,12 @@ _VAR_MAP = {
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
+    "HERMES_SESSION_ACCOUNT_ID": _SESSION_ACCOUNT_ID,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID": _CRON_AUTO_DELIVER_ACCOUNT_ID,
 }
 
 
@@ -83,6 +87,7 @@ def set_session_vars(
     thread_id: str = "",
     user_id: str = "",
     user_name: str = "",
+    account_id: str = "",
     session_key: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
@@ -100,6 +105,7 @@ def set_session_vars(
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
+        _SESSION_ACCOUNT_ID.set(account_id),
         _SESSION_KEY.set(session_key),
     ]
     return tokens
@@ -123,7 +129,12 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_THREAD_ID,
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
+        _SESSION_ACCOUNT_ID,
         _SESSION_KEY,
+        _CRON_AUTO_DELIVER_PLATFORM,
+        _CRON_AUTO_DELIVER_CHAT_ID,
+        _CRON_AUTO_DELIVER_THREAD_ID,
+        _CRON_AUTO_DELIVER_ACCOUNT_ID,
     ):
         var.set("")
 

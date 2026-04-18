@@ -40,6 +40,19 @@ class TestParseTargetPlatformChat:
         target = DeliveryTarget.parse("unknown_platform")
         assert target.platform == Platform.LOCAL
 
+    def test_weixin_explicit_account_target(self):
+        target = DeliveryTarget.parse("weixin/abc@im.bot:wxid_xxx")
+        assert target.platform == Platform.WEIXIN
+        assert target.account_id == "abc@im.bot"
+        assert target.chat_id == "wxid_xxx"
+        assert target.is_explicit is True
+
+    def test_weixin_target_preserves_account_and_chat_id_case(self):
+        target = DeliveryTarget.parse("weixin/Bot-A@Im.Bot:WxId_MixedCase")
+        assert target.platform == Platform.WEIXIN
+        assert target.account_id == "Bot-A@Im.Bot"
+        assert target.chat_id == "WxId_MixedCase"
+
 
 class TestTargetToStringRoundtrip:
     def test_origin_roundtrip(self):
@@ -64,5 +77,12 @@ class TestTargetToStringRoundtrip:
         assert reparsed.platform == Platform.TELEGRAM
         assert reparsed.chat_id == "999"
 
+    def test_weixin_account_roundtrip(self):
+        target = DeliveryTarget.parse("weixin/abc@im.bot:wxid_xxx")
+        assert target.to_string() == "weixin/abc@im.bot:wxid_xxx"
 
+        reparsed = DeliveryTarget.parse(target.to_string())
+        assert reparsed.platform == Platform.WEIXIN
+        assert reparsed.account_id == "abc@im.bot"
+        assert reparsed.chat_id == "wxid_xxx"
 

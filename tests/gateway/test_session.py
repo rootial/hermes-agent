@@ -56,6 +56,17 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_roundtrip_preserves_account_id(self):
+        source = SessionSource(
+            platform=Platform.WEIXIN,
+            chat_id="wxid_user",
+            chat_type="dm",
+            account_id="bot-a@im.bot",
+        )
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert restored.account_id == "bot-a@im.bot"
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -820,6 +831,25 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(first) == "agent:main:telegram:dm:99"
         assert build_session_key(second) == "agent:main:telegram:dm:100"
         assert build_session_key(first) != build_session_key(second)
+
+    def test_weixin_dm_session_key_includes_account_id(self):
+        source = SessionSource(
+            platform=Platform.WEIXIN,
+            chat_id="wxid_123",
+            chat_type="dm",
+            account_id="bot-a@im.bot",
+        )
+
+        assert build_session_key(source) == "agent:main:weixin:bot-a@im.bot:dm:wxid_123"
+
+    def test_weixin_dm_session_key_without_account_id_is_backward_compatible(self):
+        source = SessionSource(
+            platform=Platform.WEIXIN,
+            chat_id="wxid_123",
+            chat_type="dm",
+        )
+
+        assert build_session_key(source) == "agent:main:weixin:dm:wxid_123"
 
     def test_discord_group_includes_chat_id(self):
         """Group/channel keys include chat_type and chat_id."""

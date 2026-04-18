@@ -161,16 +161,24 @@ def _handle_list():
 
 def _handle_send(args):
     """Send a message to a platform target."""
+    from gateway.session_context import get_session_env
+
     target = args.get("target", "")
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
     parts = target.split(":", 1)
-    platform_name = parts[0].strip().lower()
+    platform_name, explicit_account_id = _split_platform_account(parts[0])
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
     thread_id = None
+    account_id = explicit_account_id
+    home = None
+
+    if platform_name == "weixin" and target_ref:
+        target_ref, target_account_id = _split_weixin_account_ref(target_ref)
+        account_id = account_id or target_account_id
 
     if target_ref:
         chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
@@ -181,7 +189,11 @@ def _handle_send(args):
     if target_ref and not is_explicit:
         try:
             from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
+            directory_platform = (
+                f"{platform_name}/{account_id}"
+                if platform_name == "weixin" and account_id else platform_name
+            )
+            resolved = resolve_channel_name(directory_platform, target_ref)
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
@@ -194,6 +206,9 @@ def _handle_send(args):
                 "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                 f"Try using a numeric channel ID instead."
             })
+    if platform_name == "weixin" and chat_id:
+        chat_id, resolved_account_id = _split_weixin_account_ref(chat_id)
+        account_id = account_id or resolved_account_id
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -265,9 +280,18 @@ def _handle_send(args):
             wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
             if wx_home:
                 from gateway.config import HomeChannel
-                home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
+                wx_home_chat_id, wx_home_account_id = _split_weixin_account_ref(wx_home)
+                home = HomeChannel(
+                    platform=platform,
+                    chat_id=wx_home_chat_id,
+                    name="Weixin Home",
+                    account_id=wx_home_account_id,
+                )
         if home:
             chat_id = home.chat_id
+            if platform_name == "weixin":
+                chat_id, home_account_id = _split_weixin_account_ref(chat_id)
+                account_id = account_id or getattr(home, "account_id", None) or home_account_id
             used_home_channel = True
         else:
             return json.dumps({
@@ -276,20 +300,34 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
             })
 
-    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
+    session_account_id = get_session_env("HERMES_SESSION_ACCOUNT_ID", "").strip() or None
+    if platform == Platform.WEIXIN:
+        account_id = account_id or session_account_id
+
+    duplicate_skip = _maybe_skip_cron_duplicate_send(
+        platform_name,
+        chat_id,
+        thread_id,
+        account_id=account_id,
+    )
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+        }
+        if account_id:
+            send_kwargs["account_id"] = account_id
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -319,6 +357,22 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+def _split_platform_account(platform_name: str) -> tuple[str, Optional[str]]:
+    """Split ``platform/account_id`` targets used by multi-account adapters."""
+    raw = str(platform_name or "").strip()
+    if "/" not in raw:
+        return raw.lower(), None
+    platform, account_id = raw.split("/", 1)
+    return platform.strip().lower(), account_id.strip() or None
+
+
+def _split_weixin_account_ref(value: str) -> tuple[str, Optional[str]]:
+    """Split ``account_id:chat_id`` values while preserving plain chat IDs."""
+    from gateway.config import parse_weixin_home_channel
+
+    return parse_weixin_home_channel(value)
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
@@ -391,14 +445,21 @@ def _get_cron_auto_delivery_target():
     if not platform or not chat_id:
         return None
     thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+    account_id = get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", "").strip() or None
     return {
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
+        "account_id": account_id,
     }
 
 
-def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
+def _maybe_skip_cron_duplicate_send(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    account_id: str | None = None,
+):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
     auto_target = _get_cron_auto_delivery_target()
     if not auto_target:
@@ -408,11 +469,13 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
         auto_target["platform"] == platform_name
         and str(auto_target["chat_id"]) == str(chat_id)
         and auto_target.get("thread_id") == thread_id
+        and (auto_target.get("account_id") or None) == (account_id or None)
     )
     if not same_target:
         return None
 
-    target_label = f"{platform_name}:{chat_id}"
+    target_platform = f"{platform_name}/{account_id}" if account_id else platform_name
+    target_label = f"{target_platform}:{chat_id}"
     if thread_id is not None:
         target_label += f":{thread_id}"
 
@@ -429,7 +492,15 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    account_id=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -504,7 +575,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # --- Weixin: use the native one-shot adapter helper for text + media ---
     if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+        return await _send_weixin(
+            pconfig,
+            chat_id,
+            message,
+            media_files=media_files,
+            account_id=account_id,
+        )
 
     # --- Discord: special handling for media attachments ---
     if platform == Platform.DISCORD:
@@ -1370,7 +1447,7 @@ async def _send_wecom(extra, chat_id, message):
         return _error(f"WeCom send failed: {e}")
 
 
-async def _send_weixin(pconfig, chat_id, message, media_files=None):
+async def _send_weixin(pconfig, chat_id, message, media_files=None, account_id=None):
     """Send via Weixin iLink using the native adapter helper."""
     try:
         from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
@@ -1386,6 +1463,7 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
             chat_id=chat_id,
             message=message,
             media_files=media_files,
+            account_id=account_id,
         )
     except Exception as e:
         return _error(f"Weixin send failed: {e}")

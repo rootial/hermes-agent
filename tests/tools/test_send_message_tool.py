@@ -227,6 +227,151 @@ class TestSendMessageTool:
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
 
+    def test_weixin_session_account_id_routes_send(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        def _session_env(key, default=""):
+            if key == "HERMES_SESSION_ACCOUNT_ID":
+                return "bot-b@im.bot"
+            return default
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env", side_effect=_session_env), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin:wxid_user",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WEIXIN,
+            weixin_cfg,
+            "wxid_user",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="bot-b@im.bot",
+        )
+
+    def test_weixin_explicit_account_target_routes_send(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="wxid_user") as resolve_mock, \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin/bot-b@im.bot:Alice (dm)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        resolve_mock.assert_called_once_with("weixin/bot-b@im.bot", "Alice (dm)")
+        send_mock.assert_awaited_once_with(
+            Platform.WEIXIN,
+            weixin_cfg,
+            "wxid_user",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="bot-b@im.bot",
+        )
+
+    def test_weixin_home_channel_supplies_account_id(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        weixin_home = SimpleNamespace(chat_id="wxid_home", account_id="bot-b@im.bot")
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: weixin_home,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WEIXIN,
+            weixin_cfg,
+            "wxid_home",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            account_id="bot-b@im.bot",
+        )
+
+    def test_weixin_cron_duplicate_target_matches_account_id(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "weixin",
+                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "wxid_user",
+                "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID": "bot-a@im.bot",
+            },
+            clear=False,
+        ), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin/bot-a@im.bot:wxid_user",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["target"] == "weixin/bot-a@im.bot:wxid_user"
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
 
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):

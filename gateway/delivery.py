@@ -39,6 +39,7 @@ class DeliveryTarget:
     platform: Platform
     chat_id: Optional[str] = None  # None means use home channel
     thread_id: Optional[str] = None
+    account_id: Optional[str] = None
     is_origin: bool = False
     is_explicit: bool = False  # True if chat_id was explicitly specified
     
@@ -53,39 +54,51 @@ class DeliveryTarget:
         - "telegram" → Telegram home channel
         - "telegram:123456" → specific Telegram chat
         """
-        target = target.strip().lower()
-        
-        if target == "origin":
+        target = target.strip()
+        target_key = target.lower()
+
+        if target_key == "origin":
             if origin:
                 return cls(
                     platform=origin.platform,
                     chat_id=origin.chat_id,
                     thread_id=origin.thread_id,
+                    account_id=origin.account_id,
                     is_origin=True,
                 )
             else:
                 # Fallback to local if no origin
                 return cls(platform=Platform.LOCAL, is_origin=True)
         
-        if target == "local":
+        if target_key == "local":
             return cls(platform=Platform.LOCAL)
         
-        # Check for platform:chat_id or platform:chat_id:thread_id format
+        # Check for platform[:account_id]:chat_id or platform[:account_id]:chat_id:thread_id format
         if ":" in target:
             parts = target.split(":", 2)
             platform_str = parts[0]
             chat_id = parts[1] if len(parts) > 1 else None
             thread_id = parts[2] if len(parts) > 2 else None
+            account_id = None
+            if "/" in platform_str:
+                platform_str, account_id = platform_str.split("/", 1)
+            platform_str = platform_str.lower()
             try:
                 platform = Platform(platform_str)
-                return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
+                return cls(
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    account_id=account_id or None,
+                    is_explicit=True,
+                )
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
         
         # Just a platform name (use home channel)
         try:
-            platform = Platform(target)
+            platform = Platform(target_key)
             return cls(platform=platform)
         except ValueError:
             # Unknown platform, treat as local
@@ -97,11 +110,14 @@ class DeliveryTarget:
             return "origin"
         if self.platform == Platform.LOCAL:
             return "local"
+        platform_value = self.platform.value
+        if self.account_id:
+            platform_value = f"{platform_value}/{self.account_id}"
         if self.chat_id and self.thread_id:
-            return f"{self.platform.value}:{self.chat_id}:{self.thread_id}"
+            return f"{platform_value}:{self.chat_id}:{self.thread_id}"
         if self.chat_id:
-            return f"{self.platform.value}:{self.chat_id}"
-        return self.platform.value
+            return f"{platform_value}:{self.chat_id}"
+        return platform_value
 
 
 class DeliveryRouter:
@@ -249,8 +265,7 @@ class DeliveryRouter:
         send_metadata = dict(metadata or {})
         if target.thread_id and "thread_id" not in send_metadata:
             send_metadata["thread_id"] = target.thread_id
+        if target.account_id and "account_id" not in send_metadata:
+            send_metadata["account_id"] = target.account_id
         return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
-
-
-
 

@@ -526,6 +526,8 @@ class TestRunJobEnvVarCleanup:
             "HERMES_SESSION_PLATFORM",
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_ACCOUNT_ID",
+            "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID",
         ):
             monkeypatch.delenv(key, raising=False)
 
@@ -540,6 +542,7 @@ class TestRunJobEnvVarCleanup:
                 "platform": "telegram",
                 "chat_id": "12345",
                 "chat_name": "Test Chat",
+                "account_id": "bot-a@im.bot",
             },
         }
 
@@ -555,3 +558,21 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
+        assert os.environ.get("HERMES_SESSION_ACCOUNT_ID") is None
+        assert os.environ.get("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID") is None
+
+    def test_resolve_delivery_target_preserves_weixin_account_id(self):
+        from cron.scheduler import _resolve_delivery_target
+
+        target = _resolve_delivery_target(
+            {
+                "deliver": "weixin/bot-a@im.bot:wxid_user",
+            }
+        )
+
+        assert target == {
+            "platform": "weixin",
+            "chat_id": "wxid_user",
+            "thread_id": None,
+            "account_id": "bot-a@im.bot",
+        }

@@ -24,6 +24,17 @@ class TestHomeChannelRoundtrip:
         assert restored.chat_id == "999"
         assert restored.name == "general"
 
+    def test_to_dict_from_dict_preserves_account_id(self):
+        hc = HomeChannel(
+            platform=Platform.WEIXIN,
+            chat_id="wxid_home",
+            name="Ops",
+            account_id="bot-b@im.bot",
+        )
+        restored = HomeChannel.from_dict(hc.to_dict())
+
+        assert restored.account_id == "bot-b@im.bot"
+
 
 class TestPlatformConfigRoundtrip:
     def test_to_dict_from_dict(self):
@@ -441,6 +452,41 @@ class TestLoadGatewayConfig:
 
         import os
         assert os.environ.get("TELEGRAM_PROXY") == "socks5://from-env:1080"
+
+    def test_top_level_weixin_section_merges_into_platform_config(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "weixin:\n"
+            "  enabled: true\n"
+            "  home_channel:\n"
+            "    chat_id: wxid_home\n"
+            "    account_id: bot-a@im.bot\n"
+            "    name: Home\n"
+            "  extra:\n"
+            "    base_url: https://ilinkai.weixin.qq.com\n"
+            "    accounts:\n"
+            "    - account_id: bot-a@im.bot\n"
+            "      token_env: WEIXIN_TOKEN\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        platform_config = config.platforms[Platform.WEIXIN]
+        assert platform_config.enabled is True
+        assert platform_config.home_channel == HomeChannel(
+            Platform.WEIXIN,
+            "wxid_home",
+            "Home",
+            account_id="bot-a@im.bot",
+        )
+        assert platform_config.extra["accounts"] == [
+            {"account_id": "bot-a@im.bot", "token_env": "WEIXIN_TOKEN"}
+        ]
 
 
 class TestHomeChannelEnvOverrides:

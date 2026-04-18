@@ -9,7 +9,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.config import get_hermes_home
 from utils import atomic_json_write
@@ -21,6 +21,14 @@ DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
 def _normalize_channel_query(value: str) -> str:
     return value.lstrip("#").strip().lower()
+
+
+def _split_platform_account(platform_name: str) -> Tuple[str, Optional[str]]:
+    normalized = str(platform_name or "").strip().lower()
+    if "/" not in normalized:
+        return normalized, None
+    base, account_id = normalized.split("/", 1)
+    return base, account_id or None
 
 
 def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
@@ -41,6 +49,14 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     if thread_id:
         return f"{chat_id}:{thread_id}"
     return str(chat_id)
+
+
+def _session_dedupe_key(origin: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    entry_id = _session_entry_id(origin)
+    if not entry_id:
+        return None
+    account_id = str(origin.get("account_id") or "").strip()
+    return (account_id, entry_id)
 
 
 def _session_entry_name(origin: Dict[str, Any]) -> str:
@@ -215,15 +231,20 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             if origin.get("platform") != platform_name:
                 continue
             entry_id = _session_entry_id(origin)
-            if not entry_id or entry_id in seen_ids:
+            dedupe_key = _session_dedupe_key(origin)
+            if not entry_id or not dedupe_key or dedupe_key in seen_ids:
                 continue
-            seen_ids.add(entry_id)
-            entries.append({
+            seen_ids.add(dedupe_key)
+            entry = {
                 "id": entry_id,
                 "name": _session_entry_name(origin),
                 "type": session.get("chat_type", "dm"),
                 "thread_id": origin.get("thread_id"),
-            })
+            }
+            account_id = str(origin.get("account_id") or "").strip()
+            if account_id:
+                entry["account_id"] = account_id
+            entries.append(entry)
     except Exception as e:
         logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
 
@@ -263,10 +284,19 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     - Telegram: display name or group name
     - Slack: "engineering", "#engineering"
     """
+    platform_key, requested_account_id = _split_platform_account(platform_name)
+
     directory = load_directory()
-    channels = directory.get("platforms", {}).get(platform_name, [])
+    channels = directory.get("platforms", {}).get(platform_key, [])
     if not channels:
         return None
+    if requested_account_id:
+        channels = [
+            ch for ch in channels
+            if str(ch.get("account_id") or "").strip().lower() == requested_account_id
+        ]
+        if not channels:
+            return None
 
     # 0. Exact ID match — case-sensitive, no normalization. Lets callers pass
     # raw platform IDs (e.g. Slack "C0B0QV5434G") even when the format guard
@@ -278,25 +308,38 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
 
     query = _normalize_channel_query(name)
 
+    def _unique_channel_id(matches: List[Dict[str, Any]]) -> Optional[str]:
+        if len(matches) == 1:
+            return matches[0]["id"]
+        return None
+
     # 1. Exact name match, including the display labels shown by send_message(action="list")
-    for ch in channels:
-        if _normalize_channel_query(ch["name"]) == query:
-            return ch["id"]
-        if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
-            return ch["id"]
+    exact_matches = [
+        ch for ch in channels
+        if _normalize_channel_query(ch["name"]) == query
+        or _normalize_channel_query(_channel_target_name(platform_key, ch)) == query
+    ]
+    resolved_exact = _unique_channel_id(exact_matches)
+    if resolved_exact:
+        return resolved_exact
 
     # 2. Guild-qualified match for Discord ("GuildName/channel")
     if "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)
-        for ch in channels:
-            guild = ch.get("guild", "").strip().lower()
-            if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
-                return ch["id"]
+        guild_matches = [
+            ch for ch in channels
+            if ch.get("guild", "").strip().lower() == guild_part
+            and _normalize_channel_query(ch["name"]) == ch_part
+        ]
+        resolved_guild = _unique_channel_id(guild_matches)
+        if resolved_guild:
+            return resolved_guild
 
     # 3. Partial prefix match (only if unambiguous)
     matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
-    if len(matches) == 1:
-        return matches[0]["id"]
+    resolved_prefix = _unique_channel_id(matches)
+    if resolved_prefix:
+        return resolved_prefix
 
     return None
 
@@ -338,7 +381,11 @@ def format_directory_for_display() -> str:
         else:
             lines.append(f"{plat_name.title()}:")
             for ch in channels:
-                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                target_platform = plat_name
+                account_id = str(ch.get("account_id") or "").strip()
+                if account_id:
+                    target_platform = f"{plat_name}/{account_id}"
+                lines.append(f"  {target_platform}:{_channel_target_name(plat_name, ch)}")
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')

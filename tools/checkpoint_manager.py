@@ -144,6 +144,14 @@ _GIT_TIMEOUT: int = max(10, min(60, int(os.getenv("HERMES_CHECKPOINT_TIMEOUT", "
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
+# When a shadow repo accumulates too many packfiles or pack bytes, run
+# maintenance to collapse duplicate packs and reclaim stale temp files.
+_MAINTENANCE_PACK_THRESHOLD = max(2, int(os.getenv("HERMES_CHECKPOINT_PACK_THRESHOLD", "8")))
+_MAINTENANCE_SIZE_PACK_KIB = max(
+    256 * 1024,
+    int(os.getenv("HERMES_CHECKPOINT_PACK_SIZE_KIB", str(1024 * 1024))),
+)
+
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
@@ -566,6 +574,34 @@ def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def _git_count_objects(shadow_repo: Path, working_dir: str) -> Dict[str, int]:
+    """Return parsed `git count-objects -v` metrics for maintenance decisions."""
+    ok, stdout, _ = _run_git(["count-objects", "-v"], shadow_repo, working_dir)
+    if not ok or not stdout:
+        return {}
+
+    metrics: Dict[str, int] = {}
+    for line in stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().replace("-", "_")
+        value = value.strip().split()[0]
+        try:
+            metrics[key] = int(value)
+        except ValueError:
+            continue
+    return metrics
+
+
+def _stale_pack_tempfiles(shadow_repo: Path) -> List[Path]:
+    """Return interrupted git repack temp files that are safe to remove."""
+    pack_dir = shadow_repo / "objects" / "pack"
+    if not pack_dir.exists():
+        return []
+    return sorted(pack_dir.glob("tmp_pack_*"))
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1062,7 @@ class CheckpointManager:
         commits older than ``max_snapshots`` and then runs ``git gc`` on the
         store so unreachable objects are reclaimed.
         """
+        self._maintain_repo(store, working_dir)
         ok, stdout, _ = _run_git(
             ["rev-list", "--count", ref], store, working_dir,
             allowed_returncodes={128},
@@ -1169,6 +1206,42 @@ class CheckpointManager:
             ["gc", "--prune=now", "--quiet"],
             store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
         )
+
+    def _maintain_repo(self, shadow_repo: Path, working_dir: str) -> None:
+        """Compact bloated checkpoint repos and remove interrupted temp packs."""
+        metrics = _git_count_objects(shadow_repo, working_dir)
+        stale_tempfiles = _stale_pack_tempfiles(shadow_repo)
+
+        should_compact = bool(stale_tempfiles)
+        if metrics:
+            should_compact = should_compact or metrics.get("garbage", 0) > 0
+            should_compact = should_compact or metrics.get("packs", 0) > _MAINTENANCE_PACK_THRESHOLD
+            should_compact = should_compact or metrics.get("size_pack", 0) > _MAINTENANCE_SIZE_PACK_KIB
+
+        if not should_compact:
+            return
+
+        for temp_path in stale_tempfiles:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Could not remove stale checkpoint temp pack %s: %s", temp_path, exc)
+
+        maintenance_timeout = max(_GIT_TIMEOUT * 8, 120)
+        commands = [
+            ["repack", "-ad"],
+            ["prune-packed"],
+            ["gc", "--prune=now"],
+        ]
+        for args in commands:
+            ok, _, err = _run_git(args, shadow_repo, working_dir, timeout=maintenance_timeout)
+            if not ok:
+                logger.debug(
+                    "Checkpoint maintenance command failed for %s: %s",
+                    shadow_repo,
+                    err,
+                )
+                return
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:

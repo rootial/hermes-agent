@@ -12,6 +12,8 @@ from tools.checkpoint_manager import (
     _init_shadow_repo,
     _run_git,
     _git_env,
+    _git_count_objects,
+    _stale_pack_tempfiles,
     _dir_file_count,
     format_checkpoint_list,
     DEFAULT_EXCLUDES,
@@ -465,6 +467,59 @@ class TestDirFileCount:
     def test_nonexistent_dir(self, tmp_path):
         count = _dir_file_count(str(tmp_path / "nonexistent"))
         assert count == 0
+
+
+# =========================================================================
+# Checkpoint maintenance
+# =========================================================================
+
+class TestCheckpointMaintenance:
+    def test_git_count_objects_parses_numeric_metrics(self, tmp_path, monkeypatch):
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            assert args == ["count-objects", "-v"]
+            return True, "count: 2\npacks: 9\nsize-pack: 2048\ngarbage: 1\n", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+        metrics = _git_count_objects(tmp_path / "shadow", str(tmp_path))
+        assert metrics["count"] == 2
+        assert metrics["packs"] == 9
+        assert metrics["size_pack"] == 2048
+        assert metrics["garbage"] == 1
+
+    def test_stale_pack_tempfiles_finds_interrupted_repack_files(self, tmp_path):
+        pack_dir = tmp_path / "shadow" / "objects" / "pack"
+        pack_dir.mkdir(parents=True)
+        keep = pack_dir / "pack-keep.pack"
+        keep.write_text("x")
+        stale = pack_dir / "tmp_pack_deadbeef"
+        stale.write_text("x")
+
+        result = _stale_pack_tempfiles(tmp_path / "shadow")
+        assert result == [stale]
+
+    def test_maintain_repo_repacks_when_repo_is_bloated(self, mgr, work_dir, monkeypatch):
+        shadow = _shadow_repo_path(str(work_dir))
+        pack_dir = shadow / "objects" / "pack"
+        pack_dir.mkdir(parents=True)
+        stale = pack_dir / "tmp_pack_deadbeef"
+        stale.write_text("garbage")
+
+        calls = []
+
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            calls.append(args)
+            if args == ["count-objects", "-v"]:
+                return True, "packs: 9\nsize-pack: 2048\ngarbage: 1\n", ""
+            return True, "", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+
+        mgr._maintain_repo(shadow, str(work_dir))
+
+        assert not stale.exists()
+        assert ["repack", "-ad"] in calls
+        assert ["prune-packed"] in calls
+        assert ["gc", "--prune=now"] in calls
 
 
 # =========================================================================

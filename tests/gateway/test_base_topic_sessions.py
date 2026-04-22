@@ -146,6 +146,42 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_process_message_background_skips_stale_response_when_newer_message_is_queued(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "ack"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        queued_event = _make_event("-1001", "17585", message_id="2")
+        session_key = build_session_key(event.source)
+        adapter._pending_messages[session_key] = queued_event
+
+        await adapter._process_message_background(event, session_key)
+
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "ack",
+                "reply_to": "2",
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.SUCCESS),
+            ("start", "2"),
+            ("complete", "2", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_total_send_failure_unsuccessful(self):
         adapter = DummyTelegramAdapter()
 

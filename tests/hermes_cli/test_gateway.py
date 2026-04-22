@@ -270,6 +270,78 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
     assert gateway.find_gateway_pids() == [321]
 
 
+def test_launchd_restart_uses_plain_kickstart_after_graceful_exit(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway-test")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway, "_get_restart_drain_timeout", lambda: 42.0)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
+    monkeypatch.setattr(gateway, "_request_gateway_self_restart", lambda pid: False)
+    monkeypatch.setattr(gateway, "terminate_pid", lambda pid, force=False: calls.append(("terminate", pid, force)))
+    monkeypatch.setattr(gateway, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+
+    def fake_run(cmd, check=False, timeout=None, **kwargs):
+        calls.append(("run", cmd, check, timeout))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    gateway.launchd_restart()
+
+    assert ("terminate", 12345, False) in calls
+    assert ("run", ["launchctl", "kickstart", "gui/501/ai.hermes.gateway-test"], True, 90) in calls
+
+
+def test_launchd_restart_forces_kickstart_when_drain_times_out(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway-test")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway, "_get_restart_drain_timeout", lambda: 42.0)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
+    monkeypatch.setattr(gateway, "_request_gateway_self_restart", lambda pid: False)
+    monkeypatch.setattr(gateway, "terminate_pid", lambda pid, force=False: calls.append(("terminate", pid, force)))
+    monkeypatch.setattr(gateway, "_wait_for_gateway_exit", lambda timeout, force_after=None: False)
+
+    def fake_run(cmd, check=False, timeout=None, **kwargs):
+        calls.append(("run", cmd, check, timeout))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    gateway.launchd_restart()
+
+    assert ("terminate", 12345, False) in calls
+    assert ("run", ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway-test"], True, 90) in calls
+
+
+def test_launchd_restart_falls_back_to_forced_kickstart_when_pid_never_reappears(monkeypatch):
+    calls = []
+    pid_reads = []
+
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway-test")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway, "_get_restart_drain_timeout", lambda: 42.0)
+    monkeypatch.setattr(gateway, "_request_gateway_self_restart", lambda pid: False)
+    monkeypatch.setattr(gateway, "terminate_pid", lambda pid, force=False: calls.append(("terminate", pid, force)))
+    monkeypatch.setattr(gateway, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid_reads.append(True) or (12345 if len(pid_reads) == 1 else None))
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    def fake_run(cmd, check=False, timeout=None, **kwargs):
+        calls.append(("run", cmd, check, timeout))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    gateway.launchd_restart()
+
+    assert ("terminate", 12345, False) in calls
+    assert ("run", ["launchctl", "kickstart", "gui/501/ai.hermes.gateway-test"], True, 90) in calls
+    assert ("run", ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway-test"], True, 90) in calls
+
+
 # ---------------------------------------------------------------------------
 # _wait_for_gateway_exit
 # ---------------------------------------------------------------------------

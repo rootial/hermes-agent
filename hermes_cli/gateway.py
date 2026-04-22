@@ -2273,12 +2273,15 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
 
 
 def launchd_restart():
+    import time
+
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
+        force_kickstart = False
         pid = get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
@@ -2292,7 +2295,21 @@ def launchd_restart():
                 exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
                 if not exited:
                     print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+                    force_kickstart = True
+        kickstart_cmd = ["launchctl", "kickstart"]
+        if force_kickstart:
+            # Only kill the launchd-managed job when graceful drain failed.
+            kickstart_cmd.append("-k")
+        kickstart_cmd.append(target)
+        subprocess.run(kickstart_cmd, check=True, timeout=90)
+        if not force_kickstart:
+            for _ in range(10):
+                if get_running_pid() is not None:
+                    break
+                time.sleep(0.3)
+            else:
+                print("⚠ launchd restart did not report a new PID after graceful drain; forcing restart")
+                subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
         if e.returncode not in (3, 113):

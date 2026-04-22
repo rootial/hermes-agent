@@ -3571,6 +3571,16 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+
+            newer_event_pending = session_key in self._pending_messages
+            if response and newer_event_pending:
+                logger.info(
+                    "[%s] Skipping stale response for %s because a newer message is queued for the same session",
+                    self.name,
+                    event.source.chat_id,
+                )
+                response = None
+
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files

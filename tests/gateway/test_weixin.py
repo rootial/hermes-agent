@@ -559,6 +559,36 @@ class TestWeixinBlankMessagePrevention:
             )
 
 
+class TestWeixinInboundOrdering:
+    def test_poll_loop_processes_batch_messages_in_order(self):
+        adapter = _make_adapter()
+        state = adapter._accounts[0]
+        adapter._running = True
+        adapter._session = object()
+        processed_ids = []
+
+        async def fake_get_updates(*args, **kwargs):
+            adapter._running = False
+            return {
+                "ret": 0,
+                "errcode": 0,
+                "msgs": [
+                    {"message_id": "msg-1", "from_user_id": "wxid_user", "item_list": []},
+                    {"message_id": "msg-2", "from_user_id": "wxid_user", "item_list": []},
+                ],
+            }
+
+        async def fake_process_message_safe(message, current_state):
+            assert current_state is state
+            processed_ids.append(message["message_id"])
+
+        with patch("gateway.platforms.weixin._get_updates", new=fake_get_updates):
+            adapter._process_message_safe = fake_process_message_safe
+            asyncio.run(adapter._poll_loop(state))
+
+        assert processed_ids == ["msg-1", "msg-2"]
+
+
 class TestWeixinStreamingCursorSuppression:
     """WeChat doesn't support message editing — cursor must be suppressed."""
 

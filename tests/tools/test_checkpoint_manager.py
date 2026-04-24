@@ -1,7 +1,9 @@
 """Tests for tools/checkpoint_manager.py — CheckpointManager."""
 
 import logging
+import os
 import subprocess
+import time
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +15,7 @@ from tools.checkpoint_manager import (
     _run_git,
     _git_env,
     _git_count_objects,
+    _stale_repo_lockfiles,
     _stale_pack_tempfiles,
     _dir_file_count,
     format_checkpoint_list,
@@ -128,6 +131,7 @@ class TestShadowRepoInit:
         content = exclude.read_text()
         assert "node_modules/" in content
         assert ".env" in content
+        assert "checkpoints/" in content
 
     def test_has_workdir_file(self, work_dir, checkpoint_base, monkeypatch):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
@@ -206,6 +210,19 @@ class TestTakeCheckpoint:
     def test_skip_home_dir(self, mgr):
         r = mgr.ensure_checkpoint(str(Path.home()), "home")
         assert r is False
+
+    def test_checkpoint_repo_does_not_snapshot_nested_checkpoints_dir(self, mgr, work_dir):
+        nested_checkpoint = work_dir / "checkpoints" / "shadow" / "objects"
+        nested_checkpoint.mkdir(parents=True)
+        (nested_checkpoint / "pack.tmp").write_text("ignore me")
+
+        result = mgr.ensure_checkpoint(str(work_dir), "initial")
+        assert result is True
+
+        shadow = _shadow_repo_path(str(work_dir))
+        ok, stdout, _ = _run_git(["ls-files", "checkpoints"], shadow, str(work_dir))
+        assert ok is True
+        assert stdout == ""
 
 
 # =========================================================================
@@ -493,9 +510,32 @@ class TestCheckpointMaintenance:
         keep.write_text("x")
         stale = pack_dir / "tmp_pack_deadbeef"
         stale.write_text("x")
+        stale_idx = pack_dir / "tmp_idx_deadbeef"
+        stale_idx.write_text("x")
+        stale_rev = pack_dir / "tmp_rev_deadbeef"
+        stale_rev.write_text("x")
 
         result = _stale_pack_tempfiles(tmp_path / "shadow")
-        assert result == [stale]
+        assert result == [stale_idx, stale, stale_rev]
+
+    def test_stale_repo_lockfiles_only_returns_old_locks(self, tmp_path):
+        shadow = tmp_path / "shadow"
+        old_lock = shadow / "index.lock"
+        fresh_lock = shadow / "refs" / "heads" / "master.lock"
+        fresh_lock.parent.mkdir(parents=True, exist_ok=True)
+        old_lock.parent.mkdir(parents=True, exist_ok=True)
+        old_lock.write_text("")
+        fresh_lock.write_text("")
+
+        stale_age = time.time() - 900
+        fresh_age = time.time() - 30
+        old_lock.touch()
+        fresh_lock.touch()
+        os.utime(old_lock, (stale_age, stale_age))
+        os.utime(fresh_lock, (fresh_age, fresh_age))
+
+        result = _stale_repo_lockfiles(shadow, stale_after_seconds=300)
+        assert result == [old_lock]
 
     def test_maintain_repo_repacks_when_repo_is_bloated(self, mgr, work_dir, monkeypatch):
         shadow = _shadow_repo_path(str(work_dir))
@@ -520,6 +560,89 @@ class TestCheckpointMaintenance:
         assert ["repack", "-ad"] in calls
         assert ["prune-packed"] in calls
         assert ["gc", "--prune=now"] in calls
+
+    def test_maintain_repo_skips_healthy_single_large_pack(self, mgr, work_dir, monkeypatch):
+        shadow = _shadow_repo_path(str(work_dir))
+        calls = []
+
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            calls.append(args)
+            if args == ["count-objects", "-v"]:
+                return True, "count: 12\npacks: 1\nsize-pack: 4096000\ngarbage: 0\n", ""
+            return True, "", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+
+        mgr._maintain_repo(shadow, str(work_dir), trigger="preflight")
+
+        assert calls == [["count-objects", "-v"]]
+
+    def test_maintain_repo_repacks_when_loose_objects_accumulate(self, mgr, work_dir, monkeypatch):
+        shadow = _shadow_repo_path(str(work_dir))
+        calls = []
+
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            calls.append(args)
+            if args == ["count-objects", "-v"]:
+                return True, "count: 5000\npacks: 1\nsize-pack: 1024\ngarbage: 0\n", ""
+            return True, "", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+
+        mgr._maintain_repo(shadow, str(work_dir), trigger="preflight")
+
+        assert ["repack", "-ad"] in calls
+        assert ["prune-packed"] in calls
+        assert ["gc", "--prune=now"] in calls
+
+    def test_maintain_repo_cleans_stale_lock_without_forcing_repack(self, mgr, work_dir, monkeypatch, caplog):
+        shadow = _shadow_repo_path(str(work_dir))
+        lock_path = shadow / "index.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("")
+        stale_age = time.time() - 900
+        os.utime(lock_path, (stale_age, stale_age))
+
+        calls = []
+
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            calls.append(args)
+            if args == ["count-objects", "-v"]:
+                return True, "packs: 1\nsize-pack: 1024\ngarbage: 0\n", ""
+            return True, "", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+
+        with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
+            mgr._maintain_repo(shadow, str(work_dir), trigger="preflight")
+
+        assert not lock_path.exists()
+        assert calls == [["count-objects", "-v"]]
+        assert any("Removed stale checkpoint git lock" in r.getMessage() for r in caplog.records)
+
+    def test_maintain_repo_warns_when_repack_fails(self, mgr, work_dir, monkeypatch, caplog):
+        shadow = _shadow_repo_path(str(work_dir))
+        stale = shadow / "objects" / "pack" / "tmp_pack_deadbeef"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("garbage")
+
+        calls = []
+
+        def fake_run_git(args, shadow_repo, working_dir, timeout=30, allowed_returncodes=None):
+            calls.append(args)
+            if args == ["count-objects", "-v"]:
+                return True, "packs: 9\nsize-pack: 2048\ngarbage: 1\n", ""
+            if args == ["repack", "-ad"]:
+                return False, "", "simulated repack failure"
+            return True, "", ""
+
+        monkeypatch.setattr("tools.checkpoint_manager._run_git", fake_run_git)
+
+        with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
+            mgr._maintain_repo(shadow, str(work_dir), trigger="preflight")
+
+        assert ["repack", "-ad"] in calls
+        assert any("Checkpoint maintenance command failed" in r.getMessage() for r in caplog.records)
 
 
 # =========================================================================

@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, List, Optional, Set
@@ -50,6 +51,7 @@ DEFAULT_EXCLUDES = [
     ".DS_Store",
     "*.log",
     ".cache/",
+    "checkpoints/",
     ".next/",
     ".nuxt/",
     "coverage/",
@@ -71,6 +73,14 @@ _MAINTENANCE_PACK_THRESHOLD = max(2, int(os.getenv("HERMES_CHECKPOINT_PACK_THRES
 _MAINTENANCE_SIZE_PACK_KIB = max(
     256 * 1024,
     int(os.getenv("HERMES_CHECKPOINT_PACK_SIZE_KIB", str(1024 * 1024))),
+)
+_MAINTENANCE_LOOSE_OBJECT_THRESHOLD = max(
+    128,
+    int(os.getenv("HERMES_CHECKPOINT_LOOSE_OBJECT_THRESHOLD", "2048")),
+)
+_LOCK_STALE_SECONDS = max(
+    300,
+    int(os.getenv("HERMES_CHECKPOINT_LOCK_STALE_SECONDS", str(max(_GIT_TIMEOUT * 4, 600)))),
 )
 
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
@@ -301,7 +311,25 @@ def _stale_pack_tempfiles(shadow_repo: Path) -> List[Path]:
     pack_dir = shadow_repo / "objects" / "pack"
     if not pack_dir.exists():
         return []
-    return sorted(pack_dir.glob("tmp_pack_*"))
+    matches = []
+    for pattern in ("tmp_pack_*", "tmp_idx_*", "tmp_rev_*"):
+        matches.extend(pack_dir.glob(pattern))
+    return sorted(matches)
+
+
+def _stale_repo_lockfiles(shadow_repo: Path, stale_after_seconds: int = _LOCK_STALE_SECONDS) -> List[Path]:
+    """Return stale git lockfiles that are old enough to clean up safely."""
+    now = time.time()
+    candidates = sorted(shadow_repo.rglob("*.lock"))
+    stale: List[Path] = []
+    for path in candidates:
+        try:
+            age_seconds = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age_seconds >= stale_after_seconds:
+            stale.append(path)
+    return stale
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +619,8 @@ class CheckpointManager:
             logger.debug("Checkpoint init failed: %s", err)
             return False
 
+        self._maintain_repo(shadow, working_dir, trigger="preflight")
+
         # Quick size guard — don't try to snapshot enormous directories
         if _dir_file_count(working_dir) > _MAX_FILES:
             logger.debug("Checkpoint skipped: >%d files in %s", _MAX_FILES, working_dir)
@@ -636,7 +666,7 @@ class CheckpointManager:
 
     def _prune(self, shadow_repo: Path, working_dir: str) -> None:
         """Run light maintenance and warn when snapshot history exceeds policy."""
-        self._maintain_repo(shadow_repo, working_dir)
+        self._maintain_repo(shadow_repo, working_dir, trigger="post-commit")
 
         ok, stdout, _ = _run_git(
             ["rev-list", "--count", "HEAD"], shadow_repo, working_dir,
@@ -659,41 +689,77 @@ class CheckpointManager:
         # is fragile for a background feature.  We just limit the log view.
         logger.debug("Checkpoint repo has %d commits (limit %d)", count, self.max_snapshots)
 
-    def _maintain_repo(self, shadow_repo: Path, working_dir: str) -> None:
-        """Compact bloated checkpoint repos and remove interrupted temp packs."""
-        metrics = _git_count_objects(shadow_repo, working_dir)
+    def _maintain_repo(self, shadow_repo: Path, working_dir: str, trigger: str = "manual") -> None:
+        """Compact bloated checkpoint repos and remove stale locks/temp packs."""
         stale_tempfiles = _stale_pack_tempfiles(shadow_repo)
+        stale_lockfiles = _stale_repo_lockfiles(shadow_repo)
 
-        should_compact = bool(stale_tempfiles)
-        if metrics:
-            should_compact = should_compact or metrics.get("garbage", 0) > 0
-            should_compact = should_compact or metrics.get("packs", 0) > _MAINTENANCE_PACK_THRESHOLD
-            should_compact = should_compact or metrics.get("size_pack", 0) > _MAINTENANCE_SIZE_PACK_KIB
-
-        if not should_compact:
-            return
+        for lock_path in stale_lockfiles:
+            try:
+                lock_path.unlink(missing_ok=True)
+                logger.warning(
+                    "Removed stale checkpoint git lock for %s during %s: %s",
+                    working_dir,
+                    trigger,
+                    lock_path,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove stale checkpoint git lock for %s during %s: %s (%s)",
+                    working_dir,
+                    trigger,
+                    lock_path,
+                    exc,
+                )
 
         for temp_path in stale_tempfiles:
             try:
                 temp_path.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.debug("Could not remove stale checkpoint temp pack %s: %s", temp_path, exc)
-
-        maintenance_timeout = max(_GIT_TIMEOUT * 8, 120)
-        commands = [
-            ["repack", "-ad"],
-            ["prune-packed"],
-            ["gc", "--prune=now"],
-        ]
-        for args in commands:
-            ok, _, err = _run_git(args, shadow_repo, working_dir, timeout=maintenance_timeout)
-            if not ok:
-                logger.debug(
-                    "Checkpoint maintenance command failed for %s: %s",
-                    shadow_repo,
-                    err,
+                logger.warning(
+                    "Removed stale checkpoint pack tempfile for %s during %s: %s",
+                    working_dir,
+                    trigger,
+                    temp_path,
                 )
-                return
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove stale checkpoint temp pack for %s during %s: %s (%s)",
+                    working_dir,
+                    trigger,
+                    temp_path,
+                    exc,
+                )
+
+        metrics = _git_count_objects(shadow_repo, working_dir)
+
+        should_compact = False
+        if metrics:
+            should_compact = should_compact or metrics.get("garbage", 0) > 0
+            should_compact = should_compact or metrics.get("packs", 0) > _MAINTENANCE_PACK_THRESHOLD
+            should_compact = should_compact or metrics.get("count", 0) > _MAINTENANCE_LOOSE_OBJECT_THRESHOLD
+            should_compact = should_compact or (
+                metrics.get("size_pack", 0) > _MAINTENANCE_SIZE_PACK_KIB
+                and metrics.get("packs", 0) > 1
+            )
+
+        if should_compact:
+            maintenance_timeout = max(_GIT_TIMEOUT * 8, 120)
+            commands = [
+                ["repack", "-ad"],
+                ["prune-packed"],
+                ["gc", "--prune=now"],
+            ]
+            for args in commands:
+                ok, _, err = _run_git(args, shadow_repo, working_dir, timeout=maintenance_timeout)
+                if not ok:
+                    logger.warning(
+                        "Checkpoint maintenance command failed for %s during %s: %s (%s)",
+                        working_dir,
+                        trigger,
+                        " ".join(args),
+                        err,
+                    )
+                    return
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:

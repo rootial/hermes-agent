@@ -575,13 +575,10 @@ async def _send_to_platform(
 
     # --- Weixin: use the native one-shot adapter helper for text + media ---
     if platform == Platform.WEIXIN:
-        return await _send_weixin(
-            pconfig,
-            chat_id,
-            message,
-            media_files=media_files,
-            account_id=account_id,
-        )
+        weixin_kwargs = {"media_files": media_files}
+        if account_id:
+            weixin_kwargs["account_id"] = account_id
+        return await _send_weixin(pconfig, chat_id, message, **weixin_kwargs)
 
     # --- Discord: special handling for media attachments ---
     if platform == Platform.DISCORD:

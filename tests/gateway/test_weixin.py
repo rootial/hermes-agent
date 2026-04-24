@@ -285,6 +285,29 @@ class TestWeixinSendMessageIntegration:
         assert _parse_target_ref("weixin", "filehelper") == ("filehelper", None, True)
         assert _parse_target_ref("weixin", "group@chatroom") == ("group@chatroom", None, True)
 
+    def test_send_image_file_accepts_shared_image_path_keyword(self):
+        adapter = _make_adapter()
+        adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="mid-1"))
+
+        result = asyncio.run(
+            adapter.send_image_file(
+                chat_id="wxid_test123",
+                image_path="/tmp/demo.png",
+                caption="chart",
+                metadata={"source": "cron"},
+                account_id="bot-b@im.bot",
+            )
+        )
+
+        assert result.success is True
+        adapter.send_document.assert_awaited_once_with(
+            chat_id="wxid_test123",
+            file_path="/tmp/demo.png",
+            caption="chart",
+            metadata={"source": "cron"},
+            account_id="bot-b@im.bot",
+        )
+
     @patch("tools.send_message_tool._send_weixin", new_callable=AsyncMock)
     def test_send_to_platform_routes_weixin_media_to_native_helper(self, send_weixin_mock):
         send_weixin_mock.return_value = {"success": True, "platform": "weixin", "chat_id": "wxid_test123"}

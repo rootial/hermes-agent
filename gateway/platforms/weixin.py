@@ -1578,7 +1578,8 @@ class WeixinAdapter(BasePlatformAdapter):
         logger.info("[%s] Disconnected", self.name)
 
     async def _poll_loop(self, state: _AccountState, *, startup_delay_seconds: float = 0.0) -> None:
-        assert self._poll_session is not None
+        poll_session = self._poll_session or getattr(self, "_session", None)
+        assert poll_session is not None
         if startup_delay_seconds > 0:
             await asyncio.sleep(startup_delay_seconds)
         sync_buf = _load_sync_buf(self._hermes_home, state.account_id)
@@ -1588,7 +1589,7 @@ class WeixinAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 response = await _get_updates(
-                    self._poll_session,
+                    poll_session,
                     base_url=state.base_url,
                     token=state.token,
                     sync_buf=sync_buf,
@@ -2298,6 +2299,7 @@ class WeixinAdapter(BasePlatformAdapter):
         account_id: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
+        """Send a local image file using the shared adapter `image_path` contract."""
         del reply_to, kwargs
         send_kwargs: Dict[str, Any] = {
             "chat_id": chat_id,
@@ -2351,7 +2353,10 @@ class WeixinAdapter(BasePlatformAdapter):
             state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
             if not state.token:
                 return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
-            message_id = await self._send_file(chat_id, video_path, caption or "", state)
+            send_kwargs: Dict[str, Any] = {}
+            if account_id or (metadata or {}).get("account_id"):
+                send_kwargs["state"] = state
+            message_id = await self._send_file(chat_id, video_path, caption or "", **send_kwargs)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)

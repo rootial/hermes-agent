@@ -12,6 +12,7 @@ from tools.skill_manager_tool import (
     _validate_category,
     _validate_frontmatter,
     _validate_file_path,
+    _load_protected_skill_names,
     _create_skill,
     _edit_skill,
     _patch_skill,
@@ -1291,6 +1292,57 @@ class TestCuratorConsolidationDeleteGuard:
         from tools.skill_manager_tool import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
+
+
+def test_protected_skill_patch_is_blocked(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "skills:\n  protected:\n    - my-skill\n", encoding="utf-8"
+    )
+    with _skill_dir(tmp_path), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+        _create_skill("my-skill", VALID_SKILL_CONTENT)
+        result = json.loads(
+            skill_manage(
+                action="patch",
+                name="my-skill",
+                old_string="Do the thing.",
+                new_string="Do the new thing.",
+            )
+        )
+
+    assert result["success"] is False
+    assert "protected" in result["error"]
+    assert "Do the thing." in (tmp_path / "my-skill" / "SKILL.md").read_text()
+
+
+def test_protected_skill_write_file_is_blocked(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "skills:\n  protected: my-skill\n", encoding="utf-8"
+    )
+    with _skill_dir(tmp_path), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+        _create_skill("my-skill", VALID_SKILL_CONTENT)
+        result = json.loads(
+            skill_manage(
+                action="write_file",
+                name="my-skill",
+                file_path="references/api.md",
+                file_content="content",
+            )
+        )
+
+    assert result["success"] is False
+    assert "protected" in result["error"]
+    assert not (tmp_path / "my-skill" / "references" / "api.md").exists()
+
+
+def test_load_protected_skill_names_rejects_mapping(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "skills:\n  protected:\n    name: my-skill\n", encoding="utf-8"
+    )
+    with patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+        protected, error = _load_protected_skill_names()
+
+    assert protected == set()
+    assert "skills.protected" in error
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):
             _create_skill("reviewed", _skill_content("reviewed"))
 

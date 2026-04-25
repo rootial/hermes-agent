@@ -1,5 +1,8 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+from types import SimpleNamespace
+
+from gateway.session_context import clear_session_vars, set_session_vars
 import tools.terminal_tool as terminal_tool
 
 
@@ -323,3 +326,36 @@ def test_transform_sudo_command_pipes_one_password_line_per_invocation(monkeypat
 def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
     assert terminal_tool._count_real_sudo_invocations("grep sudo README.md") == 0
     assert terminal_tool._count_real_sudo_invocations("sudo a; sudo b") == 2
+
+
+def test_sync_gateway_session_env_replaces_stale_values():
+    env = SimpleNamespace(env={"HERMES_SESSION_THREAD_ID": "stale"})
+    tokens = set_session_vars(
+        platform="weixin",
+        chat_id="wxid-123",
+        thread_id="thread-456",
+        account_id="account-789",
+    )
+    try:
+        terminal_tool._sync_gateway_session_env(env)
+    finally:
+        clear_session_vars(tokens)
+
+    assert env.env["HERMES_SESSION_PLATFORM"] == "weixin"
+    assert env.env["HERMES_SESSION_CHAT_ID"] == "wxid-123"
+    assert env.env["HERMES_SESSION_THREAD_ID"] == "thread-456"
+    assert env.env["HERMES_SESSION_ACCOUNT_ID"] == "account-789"
+
+
+def test_sync_gateway_session_env_clears_values_without_context():
+    env = SimpleNamespace(
+        env={
+            "PATH": "/usr/bin",
+            "HERMES_SESSION_PLATFORM": "weixin",
+            "HERMES_SESSION_CHAT_ID": "wxid-123",
+        }
+    )
+
+    terminal_tool._sync_gateway_session_env(env)
+
+    assert env.env == {"PATH": "/usr/bin"}

@@ -5,7 +5,7 @@ Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 Allows the agent to create, update, and delete skills, turning successful
 approaches into reusable procedural knowledge. New skills are created in
 ~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+can be modified or deleted wherever they live unless protected by config.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -126,6 +126,7 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
+PROTECTED_MUTATING_ACTIONS = {"edit", "patch", "delete", "write_file", "remove_file"}
 
 
 # =============================================================================
@@ -247,6 +248,50 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
         for skill_md in skills_dir.rglob("SKILL.md"):
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
+    return None
+
+
+def _load_protected_skill_names() -> Tuple[set, Optional[str]]:
+    """Read skills.protected from config.yaml for mutation guardrails."""
+    config_path = HERMES_HOME / "config.yaml"
+    if not config_path.exists():
+        return set(), None
+
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        return set(), f"Could not read config.yaml for protected skills: {e}"
+
+    if not isinstance(parsed, dict):
+        return set(), "config.yaml must be a YAML mapping."
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set(), None
+
+    raw = skills_cfg.get("protected")
+    if raw is None:
+        return set(), None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set(), "skills.protected must be a list of skill names."
+
+    return {str(v).strip() for v in raw if str(v).strip()}, None
+
+
+def _protected_skill_error(name: str, action: str) -> Optional[Dict[str, Any]]:
+    protected, error = _load_protected_skill_names()
+    if error:
+        return {"success": False, "error": error}
+    if name in protected or "*" in protected:
+        return {
+            "success": False,
+            "error": (
+                f"Skill '{name}' is protected by config.yaml "
+                f"(skills.protected) and cannot run action '{action}'."
+            ),
+        }
     return None
 
 
@@ -659,6 +704,11 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    if action in PROTECTED_MUTATING_ACTIONS:
+        protected_result = _protected_skill_error(name, action)
+        if protected_result:
+            return json.dumps(protected_result, ensure_ascii=False)
+
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
@@ -713,7 +763,8 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live "
+        "unless their names appear in config.yaml skills.protected.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

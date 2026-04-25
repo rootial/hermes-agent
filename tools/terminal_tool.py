@@ -46,6 +46,49 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_SESSION_ENV_KEYS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_ACCOUNT_ID",
+    "HERMES_SESSION_KEY",
+)
+
+
+def _current_gateway_session_env() -> Dict[str, str]:
+    """Return the current gateway session context as subprocess env vars."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {}
+
+    values: Dict[str, str] = {}
+    for key in _GATEWAY_SESSION_ENV_KEYS:
+        value = get_session_env(key, "")
+        if value:
+            values[key] = value
+    return values
+
+
+def _sync_gateway_session_env(env: Any) -> None:
+    """Copy task-local gateway context into reusable terminal environments.
+
+    Gateway session state lives in contextvars for concurrency safety, while
+    shell subprocesses only receive process environment variables.  Terminal
+    environments are reused, so stale session keys are cleared before adding
+    the current request's values.
+    """
+    env_vars = getattr(env, "env", None)
+    if not isinstance(env_vars, dict):
+        return
+
+    for key in _GATEWAY_SESSION_ENV_KEYS:
+        env_vars.pop(key, None)
+    env_vars.update(_current_gateway_session_env())
+
 
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
@@ -1693,6 +1736,8 @@ def terminal_tool(
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+
+        _sync_gateway_session_env(env)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)

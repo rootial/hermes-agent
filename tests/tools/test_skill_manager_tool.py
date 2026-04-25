@@ -13,6 +13,7 @@ from tools.skill_manager_tool import (
     _validate_frontmatter,
     _validate_file_path,
     _find_skill,
+    _load_protected_skill_names,
     _resolve_skill_dir,
     _create_skill,
     _edit_skill,
@@ -484,6 +485,53 @@ class TestSkillManageDispatcher:
             raw = skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
         result = json.loads(raw)
         assert result["success"] is True
+
+    def test_protected_skill_patch_blocked(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("skills:\n  protected:\n    - my-skill\n", encoding="utf-8")
+
+        with _skill_dir(tmp_path), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            raw = skill_manage(
+                action="patch",
+                name="my-skill",
+                old_string="Do the thing.",
+                new_string="Do the new thing.",
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "protected" in result["error"]
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        assert "Do the thing." in content
+
+    def test_protected_skill_write_file_blocked(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("skills:\n  protected: my-skill\n", encoding="utf-8")
+
+        with _skill_dir(tmp_path), patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            raw = skill_manage(
+                action="write_file",
+                name="my-skill",
+                file_path="references/api.md",
+                file_content="content",
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "protected" in result["error"]
+        assert not (tmp_path / "my-skill" / "references" / "api.md").exists()
+
+    def test_load_protected_skill_names_rejects_bad_shape(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("skills:\n  protected:\n    name: my-skill\n", encoding="utf-8")
+
+        with patch("tools.skill_manager_tool.HERMES_HOME", tmp_path):
+            protected, error = _load_protected_skill_names()
+
+        assert protected == set()
+        assert "skills.protected" in error
 
 
 class TestSecurityScanGate:

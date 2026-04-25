@@ -493,6 +493,11 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # Protected skills — block agent-initiated edit/patch/delete/write_file/remove_file
+  # through skill_manage. Useful for hand-maintained profile skills.
+  # protected:
+  #   - stock-video-analyzer
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

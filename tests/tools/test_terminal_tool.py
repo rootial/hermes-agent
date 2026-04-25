@@ -1,6 +1,26 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for terminal tool command handling."""
 
+import json
+from unittest.mock import MagicMock, patch
+
+from gateway.session_context import clear_session_vars, set_session_vars
 import tools.terminal_tool as terminal_tool
+
+
+def _make_env_config(**overrides):
+    config = {
+        "env_type": "local",
+        "timeout": 180,
+        "cwd": "/tmp",
+        "host_cwd": None,
+        "modal_mode": "auto",
+        "docker_image": "",
+        "singularity_image": "",
+        "modal_image": "",
+        "daytona_image": "",
+    }
+    config.update(overrides)
+    return config
 
 
 def setup_function():
@@ -117,3 +137,86 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_gateway_session_env_is_available_to_foreground_commands():
+    mock_env = MagicMock()
+    mock_env.env = {"HERMES_SESSION_THREAD_ID": "stale-thread"}
+    mock_env.execute.return_value = {"output": "done", "returncode": 0}
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="channel-123",
+        thread_id="thread-456",
+        user_id="user-789",
+    )
+    try:
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+             patch("tools.terminal_tool._last_activity", {"default": 0}), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+            result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["exit_code"] == 0
+    assert mock_env.env["HERMES_SESSION_PLATFORM"] == "discord"
+    assert mock_env.env["HERMES_SESSION_CHAT_ID"] == "channel-123"
+    assert mock_env.env["HERMES_SESSION_THREAD_ID"] == "thread-456"
+    assert mock_env.env["HERMES_SESSION_USER_ID"] == "user-789"
+
+
+def test_gateway_session_env_is_cleared_when_context_is_empty():
+    mock_env = MagicMock()
+    mock_env.env = {
+        "HERMES_SESSION_PLATFORM": "discord",
+        "HERMES_SESSION_CHAT_ID": "channel-123",
+        "HERMES_SESSION_THREAD_ID": "thread-456",
+    }
+    mock_env.execute.return_value = {"output": "done", "returncode": 0}
+
+    with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+         patch("tools.terminal_tool._last_activity", {"default": 0}), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+
+    assert result["exit_code"] == 0
+    assert "HERMES_SESSION_PLATFORM" not in mock_env.env
+    assert "HERMES_SESSION_CHAT_ID" not in mock_env.env
+    assert "HERMES_SESSION_THREAD_ID" not in mock_env.env
+
+
+def test_gateway_session_env_is_passed_to_background_process_registry():
+    mock_env = MagicMock()
+    mock_env.env = {}
+    mock_proc_session = MagicMock()
+    mock_proc_session.id = "proc-test"
+    mock_proc_session.pid = 1234
+    mock_registry = MagicMock()
+    mock_registry.spawn_local.return_value = mock_proc_session
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="channel-123",
+        thread_id="thread-456",
+    )
+    try:
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+             patch("tools.terminal_tool._last_activity", {"default": 0}), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+             patch("tools.process_registry.process_registry", mock_registry), \
+             patch("tools.approval.get_current_session_key", return_value="session-key"):
+            result = json.loads(
+                terminal_tool.terminal_tool(command="sleep 10", background=True)
+            )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["session_id"] == "proc-test"
+    env_vars = mock_registry.spawn_local.call_args.kwargs["env_vars"]
+    assert env_vars["HERMES_SESSION_PLATFORM"] == "discord"
+    assert env_vars["HERMES_SESSION_CHAT_ID"] == "channel-123"
+    assert env_vars["HERMES_SESSION_THREAD_ID"] == "thread-456"

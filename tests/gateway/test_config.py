@@ -220,6 +220,7 @@ class TestLoadGatewayConfig:
         )
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEIXIN_HOME_CHANNEL", raising=False)
 
         config = load_gateway_config()
 
@@ -232,6 +233,7 @@ class TestLoadGatewayConfig:
         config_path.write_text("group_sessions_per_user: false\n", encoding="utf-8")
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEIXIN_HOME_CHANNEL", raising=False)
 
         config = load_gateway_config()
 
@@ -473,6 +475,7 @@ class TestLoadGatewayConfig:
         )
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEIXIN_HOME_CHANNEL", raising=False)
 
         config = load_gateway_config()
 

@@ -557,12 +557,15 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "kickstart", target],
         ]
 
-    def test_launchd_restart_drains_running_gateway_before_kickstart(self, monkeypatch):
+    def test_launchd_restart_drains_running_gateway_before_reload(self, tmp_path, monkeypatch):
         calls = []
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist", encoding="utf-8")
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
-        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, drain_timeout: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
         monkeypatch.setattr(
@@ -580,31 +583,68 @@ class TestLaunchdServiceRecovery:
 
         assert calls == [
             ("term", 321, False),
+            ["launchctl", "bootout", target],
+            ["launchctl", "bootstrap", gateway_cli._launchd_domain(), str(plist_path)],
             ["launchctl", "kickstart", target],
         ]
 
-    def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
+    def test_launchd_restart_reloads_after_graceful_sigusr1_drain(self, tmp_path, monkeypatch, capsys):
         calls = []
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist", encoding="utf-8")
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
         )
         monkeypatch.setattr(
             gateway_cli,
-            "_request_gateway_self_restart",
-            lambda pid: calls.append(("self", pid)) or True,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, drain_timeout: calls.append(("sigusr1", pid, drain_timeout)) or True,
         )
-        monkeypatch.setattr(
-            gateway_cli.subprocess,
-            "run",
-            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should not run")),
-        )
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.launchd_restart()
 
-        assert calls == [("self", 321)]
-        assert "restart requested" in capsys.readouterr().out.lower()
+        assert calls == [
+            ("sigusr1", 321, 12.0),
+            ["launchctl", "bootout", target],
+            ["launchctl", "bootstrap", gateway_cli._launchd_domain(), str(plist_path)],
+            ["launchctl", "kickstart", target],
+        ]
+        assert "service restarted" in capsys.readouterr().out.lower()
+
+    def test_launchd_reload_job_retries_bootstrap_eio(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist", encoding="utf-8")
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "bootstrap"] and calls.count(cmd) == 1:
+                raise gateway_cli.subprocess.CalledProcessError(5, cmd, stderr="Input/output error")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli._launchd_reload_job(plist_path, target)
+
+        assert calls == [
+            ["launchctl", "bootout", target],
+            ["launchctl", "bootstrap", gateway_cli._launchd_domain(), str(plist_path)],
+            ["launchctl", "bootout", target],
+            ["launchctl", "bootstrap", gateway_cli._launchd_domain(), str(plist_path)],
+            ["launchctl", "kickstart", target],
+        ]
 
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""

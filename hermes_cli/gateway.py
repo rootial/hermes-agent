@@ -4285,6 +4285,33 @@ def launchd_stop():
     print("✓ Service stopped")
 
 
+def _launchd_reload_job(plist_path: Path, target: str, *, retries: int = 3) -> None:
+    """Reload a launchd job definition and start it fresh.
+
+    A bootout/bootstrap cycle clears launchd's cached ``LastExitStatus`` for the
+    job, which a plain ``kickstart`` does not.  ``bootstrap`` can briefly fail
+    with exit code 5 while launchd tears down the previous instance, so retry a
+    few times before surfacing the error.
+    """
+    import time
+
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(retries):
+        subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
+        try:
+            subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if exc.returncode != 5 or attempt == retries - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+
+
 def _wait_for_gateway_exit(
     timeout: float = 10.0, force_after: float | None = 5.0
 ) -> bool:
@@ -4338,54 +4365,30 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
-    import time
-
+    plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
-        force_kickstart = False
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
-            print("✓ Service restart requested")
-            _clear_launchd_unsupported_marker()
-            return
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
             print(
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
                 f"(up to {drain_timeout:.0f}s)..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
-                    force_kickstart = True
-        kickstart_cmd = ["launchctl", "kickstart"]
-        if force_kickstart:
-            # Only kill the launchd-managed job when graceful drain failed.
-            kickstart_cmd.append("-k")
-        kickstart_cmd.append(target)
-        subprocess.run(kickstart_cmd, check=True, timeout=90)
-        if not force_kickstart:
-            for _ in range(10):
-                if get_running_pid() is not None:
-                    break
-                time.sleep(0.3)
-            else:
-                print("⚠ launchd restart did not report a new PID after graceful drain; forcing restart")
-                subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+            exited = _graceful_restart_via_sigusr1(pid, drain_timeout)
+            if not exited:
+                try:
+                    terminate_pid(pid, force=False)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pid = None
+                if pid is not None:
+                    exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+            if not exited:
+                print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd reload")
+        _launchd_reload_job(plist_path, target)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
@@ -4399,24 +4402,8 @@ def launchd_restart():
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
         try:
-            # Restart is the one path where the job is almost always still
-            # registered (we just drained it), so a plain bootstrap would hit
-            # EIO on the common case. Boot the stale label out first — cheaper
-            # and clearer here than routing through _launchctl_bootstrap's
-            # bootstrap-first/retry-on-EIO flow. See #23387, #42914.
-            subprocess.run(
-                ["launchctl", "bootout", target],
-                check=False,
-                timeout=90,
-            )
-            subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
-                check=True,
-                timeout=30,
-            )
-            subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+            _launchd_reload_job(plist_path, target)
         except subprocess.CalledProcessError as e2:
             if not _launchctl_domain_unsupported(e2.returncode):
                 raise

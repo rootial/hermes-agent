@@ -108,9 +108,13 @@ def cron_list(show_all: bool = False):
             last_run = job.get("last_run_at", "?")
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)
+                print(f"    Last run:  {last_run}  {status_display}")
+            elif last_status == "pending" and not job.get("last_run_at"):
+                status_display = color("pending first run", Colors.YELLOW)
+                print(f"    Last run:  {status_display}")
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
-            print(f"    Last run:  {last_run}  {status_display}")
+                print(f"    Last run:  {last_run}  {status_display}")
 
         delivery_err = job.get("last_delivery_error")
         if delivery_err:

@@ -8069,6 +8069,8 @@ class HermesCLI:
                 print(f"  Prompt: {job.get('prompt_preview', '')}")
                 if job.get("last_run_at"):
                     print(f"  Last run: {job['last_run_at']} ({job.get('last_status', '?')})")
+                elif job.get("last_status") == "pending":
+                    print("  Last run: pending first run")
                 print()
             return
 

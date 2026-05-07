@@ -111,3 +111,11 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+    def test_list_shows_pending_first_run(self, tmp_cron_dir, capsys):
+        create_job(prompt="Pending job", schedule="every 1h")
+
+        cron_command(Namespace(cron_command="list", all=False))
+
+        out = capsys.readouterr().out
+        assert "pending first run" in out.lower()

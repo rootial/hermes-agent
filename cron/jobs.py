@@ -44,6 +44,7 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+FIRST_RUN_PENDING_STATUS = "pending"
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -118,6 +119,27 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _should_mark_pending_first_run(job: Dict[str, Any]) -> bool:
+    """Return True when a job is enabled but has not recorded its first run yet."""
+    if not job.get("enabled", True):
+        return False
+    if job.get("state") == "paused":
+        return False
+    if job.get("last_run_at") is not None:
+        return False
+    last_status = job.get("last_status")
+    return last_status in (None, "")
+
+
+def _normalize_pending_first_run(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Make first-run pending state explicit for enabled jobs."""
+    normalized = dict(job)
+    if _should_mark_pending_first_run(normalized):
+        normalized["last_status"] = FIRST_RUN_PENDING_STATUS
+        normalized["last_error"] = None
+    return normalized
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -152,8 +174,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
 
     profile = _coerce_job_text(normalized.get("profile")).strip()
     normalized["profile"] = profile or None
-
-    return normalized
+    return _normalize_pending_first_run(normalized)
 
 
 def _secure_dir(path: Path):
@@ -432,7 +453,11 @@ def load_jobs() -> List[Dict[str, Any]]:
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            jobs = data.get("jobs", [])
+            normalized_jobs = [_normalize_pending_first_run(job) for job in jobs]
+            if normalized_jobs != jobs:
+                save_jobs(normalized_jobs)
+            return normalized_jobs
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
@@ -440,9 +465,11 @@ def load_jobs() -> List[Dict[str, Any]]:
                 data = json.loads(f.read(), strict=False)
                 jobs = data.get("jobs", [])
                 if jobs:
-                    # Auto-repair: rewrite with proper escaping
-                    save_jobs(jobs)
+                    # Auto-repair: rewrite with proper escaping and current status normalization.
+                    normalized_jobs = [_normalize_pending_first_run(job) for job in jobs]
+                    save_jobs(normalized_jobs)
                     logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+                    return normalized_jobs
                 return jobs
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -675,7 +702,7 @@ def create_job(
         "created_at": now,
         "next_run_at": compute_next_run(parsed_schedule),
         "last_run_at": None,
-        "last_status": None,
+        "last_status": FIRST_RUN_PENDING_STATUS,
         "last_error": None,
         "last_delivery_error": None,
         # Delivery configuration
@@ -808,6 +835,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        updated = _normalize_pending_first_run(updated)
+
         jobs[i] = updated
         save_jobs(jobs)
         return _normalize_job_record(jobs[i])
@@ -845,6 +874,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": next_run_at,
+            "last_status": job.get("last_status") or FIRST_RUN_PENDING_STATUS,
         },
     )
 

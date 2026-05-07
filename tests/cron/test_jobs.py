@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cron.jobs import (
+    FIRST_RUN_PENDING_STATUS,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -196,6 +197,8 @@ class TestJobCRUD:
         assert job["prompt"] == "Check server status"
         assert job["enabled"] is True
         assert job["schedule"]["kind"] == "once"
+        assert job["last_run_at"] is None
+        assert job["last_status"] == FIRST_RUN_PENDING_STATUS
 
         fetched = get_job(job["id"])
         assert fetched is not None
@@ -347,6 +350,32 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+
+    def test_resume_marks_never_run_job_pending(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "resume-pending",
+            "name": "Resume pending",
+            "prompt": "Resume pending",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            "schedule_display": "every 60m",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-05-08T00:00:00+08:00",
+            "paused_reason": "manual pause",
+            "created_at": "2026-05-08T00:00:00+08:00",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        resumed = resume_job("resume-pending")
+        assert resumed is not None
+        assert resumed["last_status"] == FIRST_RUN_PENDING_STATUS
 
 
 class TestResolveJobRef:
@@ -850,6 +879,59 @@ class TestGetDueJobs:
         if recovered_dt.tzinfo is None:
             recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
         assert recovered_dt > now
+
+
+class TestLoadJobsNormalization:
+    def test_enabled_never_run_job_is_migrated_to_pending(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "pending-migrate",
+            "name": "Pending migrate",
+            "prompt": "Pending migrate",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            "schedule_display": "every 60m",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-05-08T00:00:00+08:00",
+            "next_run_at": "2026-05-08T01:00:00+08:00",
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        loaded = load_jobs()
+        assert loaded[0]["last_status"] == FIRST_RUN_PENDING_STATUS
+        assert get_job("pending-migrate")["last_status"] == FIRST_RUN_PENDING_STATUS
+
+    def test_paused_never_run_job_keeps_null_last_status(self, tmp_cron_dir):
+        save_jobs([{
+            "id": "paused-null-ok",
+            "name": "Paused null",
+            "prompt": "Paused null",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            "schedule_display": "every 60m",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-05-08T00:00:00+08:00",
+            "paused_reason": "manual pause",
+            "created_at": "2026-05-08T00:00:00+08:00",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        loaded = load_jobs()
+        assert loaded[0]["last_status"] is None
 
 
 class TestEnabledToolsets:

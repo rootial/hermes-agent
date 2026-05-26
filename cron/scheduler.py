@@ -1578,6 +1578,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
         model_max_tokens = None
+        _raw_job_max_tokens = job.get("max_tokens")
+        if isinstance(_raw_job_max_tokens, (int, float)) and _raw_job_max_tokens > 0:
+            model_max_tokens = int(_raw_job_max_tokens)
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -1594,7 +1597,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
-                if isinstance(_model_cfg, dict):
+                if model_max_tokens is None and isinstance(_model_cfg, dict):
                     _raw_model_max_tokens = _model_cfg.get("max_tokens")
                     if isinstance(_raw_model_max_tokens, (int, float)) and _raw_model_max_tokens > 0:
                         model_max_tokens = int(_raw_model_max_tokens)

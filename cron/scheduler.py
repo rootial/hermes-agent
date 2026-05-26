@@ -1405,6 +1405,37 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        if job.get("relay_script_output"):
+            if _ran_ok:
+                relayed = _script_output or ""
+                output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Response
+
+{relayed or "(No response generated)"}
+"""
+                logger.info("Job '%s' relayed script output directly", job_name)
+                return True, output, relayed, None
+
+            error_msg = _script_output or "Script relay failed"
+            output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Error
+
+```
+{error_msg}
+```
+"""
+            logger.error("Job '%s' relay script failed: %s", job_name, error_msg)
+            return False, output, "", error_msg
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",

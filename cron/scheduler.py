@@ -2868,6 +2868,7 @@ def run_job(
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        model_max_tokens = None
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -2899,6 +2900,10 @@ def run_job(
                         _default = _model_cfg.get("default") or _model_cfg.get("model")
                         if _default:
                             model = _default
+                if isinstance(_model_cfg, dict):
+                    _raw_model_max_tokens = _model_cfg.get("max_tokens")
+                    if isinstance(_raw_model_max_tokens, (int, float)) and _raw_model_max_tokens > 0:
+                        model_max_tokens = int(_raw_model_max_tokens)
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -3112,6 +3117,7 @@ def run_job(
             acp_command=runtime.get("command"),
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,
+            max_tokens=model_max_tokens,
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,

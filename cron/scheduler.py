@@ -2900,6 +2900,9 @@ def run_job(
         # on the next tick — there is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
         model_max_tokens = None
+        _raw_job_max_tokens = job.get("max_tokens")
+        if isinstance(_raw_job_max_tokens, (int, float)) and _raw_job_max_tokens > 0:
+            model_max_tokens = int(_raw_job_max_tokens)
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -2931,7 +2934,7 @@ def run_job(
                         _default = _model_cfg.get("default") or _model_cfg.get("model")
                         if _default:
                             model = _default
-                if isinstance(_model_cfg, dict):
+                if model_max_tokens is None and isinstance(_model_cfg, dict):
                     _raw_model_max_tokens = _model_cfg.get("max_tokens")
                     if isinstance(_raw_model_max_tokens, (int, float)) and _raw_model_max_tokens > 0:
                         model_max_tokens = int(_raw_model_max_tokens)

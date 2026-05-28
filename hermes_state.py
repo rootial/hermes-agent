@@ -621,6 +621,15 @@ class SessionDB:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_pending "
+                "ON sessions(handoff_state, started_at) "
+                "WHERE handoff_state IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("idx_sessions_handoff_pending create skipped: %s", exc)
+
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
         # version.  No version-gated column additions remain.
@@ -3273,7 +3282,8 @@ class SessionDB:
         """
         try:
             cur = self._conn.execute(
-                "SELECT * FROM sessions "
+                "SELECT id, title, handoff_state, handoff_platform, started_at "
+                "FROM sessions "
                 "WHERE handoff_state = 'pending' "
                 "ORDER BY started_at ASC"
             )
@@ -3311,4 +3321,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

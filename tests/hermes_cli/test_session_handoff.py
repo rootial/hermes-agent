@@ -45,6 +45,17 @@ class TestHandoffStateDB:
             "FROM sessions LIMIT 0"
         )
 
+    def test_pending_handoff_query_uses_dedicated_index(self, db):
+        plan_rows = db._conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id, title, handoff_state, handoff_platform, started_at "
+            "FROM sessions "
+            "WHERE handoff_state = 'pending' "
+            "ORDER BY started_at ASC"
+        ).fetchall()
+        plan = " ".join(str(row[3]) for row in plan_rows)
+        assert "idx_sessions_handoff_pending" in plan
+
     def test_request_handoff_marks_pending(self, db):
         sid = "sess-1"
         self._make_session(db, sid)

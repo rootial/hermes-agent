@@ -235,6 +235,9 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "invalid model",
     "model not found",
     "model_not_found",
+    "model is not available",
+    "model not available",
+    "not available in your region",
     "does not exist",
     "no such model",
     "unknown model",
@@ -690,6 +693,12 @@ def _classify_by_status(
         )
 
     if status_code == 403:
+        if any(p in error_msg for p in _MODEL_NOT_FOUND_PATTERNS):
+            return result_fn(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_fallback=True,
+            )
         # OpenRouter 403 "key limit exceeded" is actually billing
         if "key limit exceeded" in error_msg or "spending limit" in error_msg:
             return result_fn(

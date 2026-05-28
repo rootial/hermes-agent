@@ -338,6 +338,34 @@ class TestWeixinSendMessageIntegration:
         assert _parse_target_ref("weixin", "filehelper") == ("filehelper", None, True)
         assert _parse_target_ref("weixin", "group@chatroom") == ("group@chatroom", None, True)
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._make_ssl_connector", return_value=None)
+    def test_send_weixin_direct_uses_config_account_id_for_one_shot_adapter(
+        self,
+        _connector_mock,
+        send_message_mock,
+        tmp_path,
+    ):
+        send_message_mock.return_value = {"ret": 0, "errcode": 0}
+
+        with patch("gateway.platforms.weixin.get_hermes_home", return_value=tmp_path):
+            result = asyncio.run(
+                weixin.send_weixin_direct(
+                    extra={
+                        "account_id": "bot-account",
+                        "base_url": "https://weixin.example.com",
+                    },
+                    token="bot-token",
+                    chat_id="wxid_user",
+                    message="hello",
+                )
+            )
+
+        assert result["success"] is True
+        assert result["account_id"] == "bot-account"
+        send_message_mock.assert_awaited_once()
+        assert send_message_mock.await_args.kwargs["to"] == "wxid_user"
+
     def test_send_image_file_accepts_shared_image_path_keyword(self):
         adapter = _make_adapter()
         adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="mid-1"))
@@ -907,14 +935,15 @@ class TestWeixinContentDedup:
         adapter = _make_adapter()
         adapter._poll_session = object()
         adapter.handle_message = AsyncMock()
+        state = adapter._resolve_account_state()
 
         base_msg = {
             "from_user_id": "wxid_user1",
             "item_list": [{"type": 1, "text_item": {"text": "hello world"}}],
         }
 
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-1"}))
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-2"}))
+        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-1"}, state))
+        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-2"}, state))
 
         assert adapter.handle_message.await_count == 1
         event = adapter.handle_message.await_args[0][0]
@@ -925,13 +954,14 @@ class TestWeixinContentDedup:
         adapter._poll_session = object()
         adapter.handle_message = AsyncMock()
         adapter._dedup.is_duplicate = Mock(return_value=False)
+        state = adapter._resolve_account_state()
 
         empty_msg = {
             "from_user_id": "wxid_user1",
             "message_id": "msg-1",
             "item_list": [],
         }
-        asyncio.run(adapter._process_message(empty_msg))
+        asyncio.run(adapter._process_message(empty_msg, state))
 
         assert adapter.handle_message.await_count == 0
         # is_duplicate should only be called for message_id, never for content

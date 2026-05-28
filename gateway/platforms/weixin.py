@@ -2508,7 +2508,7 @@ async def send_weixin_direct(
                 token=resolved_token,
                 extra={
                     **dict(extra or {}),
-                    "account_id": account_id,
+                    "account_id": resolved_account_id,
                     "base_url": base_url,
                     "cdn_base_url": cdn_base_url,
                 },

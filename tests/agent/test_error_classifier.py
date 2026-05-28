@@ -246,6 +246,14 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="openrouter")
         assert result.reason == FailoverReason.billing
 
+    def test_403_model_unavailable_in_region_falls_back_without_credential_rotation(self):
+        e = MockAPIError("This model is not available in your region.", status_code=403)
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.4-mini")
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+
     # ── Billing ──
 
     def test_402_plain_billing(self):

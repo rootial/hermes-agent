@@ -365,11 +365,12 @@ def _recoverable_oneshot_run_at(
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
-    Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    Uses half the schedule period, clamped between 5 minutes and 2 hours.
+    The 5-minute floor lets frequent jobs survive one long scheduler tick:
+    tick() holds the cron lock until all due jobs complete, so a slow job can
+    legitimately delay the next due-job scan by several minutes.
     """
-    MIN_GRACE = 120
+    MIN_GRACE = 300
     MAX_GRACE = 7200  # 2 hours
 
     kind = schedule.get("kind")

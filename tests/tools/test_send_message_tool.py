@@ -479,6 +479,59 @@ class TestSendMessageTool:
             account_id="bot-b@im.bot",
         )
 
+    def test_weixin_im_wechat_target_routes_to_directory_account(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        directory = {
+            "platforms": {
+                "weixin": [
+                    {
+                        "id": "o9cq80-other@im.wechat",
+                        "name": "o9cq80-other@im.wechat",
+                        "type": "dm",
+                        "account_id": "bot-c@im.bot",
+                    }
+                ]
+            }
+        }
+
+        def _session_env(key, default=""):
+            if key == "HERMES_SESSION_ACCOUNT_ID":
+                return "bot-b@im.bot"
+            return default
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env", side_effect=_session_env), \
+             patch("gateway.channel_directory.load_directory", return_value=directory), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin:o9cq80-other@im.wechat",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WEIXIN,
+            weixin_cfg,
+            "o9cq80-other@im.wechat",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+            account_id="bot-c@im.bot",
+        )
+
     def test_weixin_explicit_account_target_routes_send(self):
         weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
         config = SimpleNamespace(
@@ -513,6 +566,54 @@ class TestSendMessageTool:
             media_files=[],
             force_document=False,
             account_id="bot-b@im.bot",
+        )
+
+    def test_weixin_directory_name_resolution_carries_account_id(self):
+        weixin_cfg = SimpleNamespace(enabled=True, token="bot-token", extra={"account_id": "bot-a@im.bot"})
+        config = SimpleNamespace(
+            platforms={Platform.WEIXIN: weixin_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+        directory = {
+            "platforms": {
+                "weixin": [
+                    {
+                        "id": "o9cq80-other@im.wechat",
+                        "name": "Alice (dm)",
+                        "type": "dm",
+                        "account_id": "bot-c@im.bot",
+                    }
+                ]
+            }
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value="o9cq80-other@im.wechat"), \
+             patch("gateway.channel_directory.load_directory", return_value=directory), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "weixin:Alice (dm)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WEIXIN,
+            weixin_cfg,
+            "o9cq80-other@im.wechat",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+            account_id="bot-c@im.bot",
         )
 
     def test_weixin_home_channel_supplies_account_id(self):

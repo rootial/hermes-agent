@@ -30,7 +30,10 @@ _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::(
 _SLACK_TARGET_RE = re.compile(r"^\s*([CGDU][A-Z0-9]{8,})\s*$")
 # Session-derived Slack thread targets use "<conversation_id>:<thread_ts>".
 _SLACK_THREAD_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,}):([^\s:]+)\s*$")
-_WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
+_WEIXIN_TARGET_RE = re.compile(
+    r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|"
+    r"[A-Za-z0-9._-]+@chatroom|[A-Za-z0-9._-]+@im\.wechat|filehelper)\s*$"
+)
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
@@ -203,6 +206,8 @@ def _handle_send(args):
             resolved = resolve_channel_name(directory_platform, target_ref)
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                if platform_name == "weixin" and chat_id and not account_id:
+                    account_id = _weixin_directory_account_id_for_chat(chat_id)
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -216,6 +221,7 @@ def _handle_send(args):
     if platform_name == "weixin" and chat_id:
         chat_id, resolved_account_id = _split_weixin_account_ref(chat_id)
         account_id = account_id or resolved_account_id
+        account_id = account_id or _weixin_directory_account_id_for_chat(chat_id)
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -392,6 +398,31 @@ def _split_weixin_account_ref(value: str) -> tuple[str, Optional[str]]:
     from gateway.config import parse_weixin_home_channel
 
     return parse_weixin_home_channel(value)
+
+
+def _weixin_directory_account_id_for_chat(chat_id: str) -> Optional[str]:
+    """Return the unique Weixin account_id that owns a directory chat_id.
+
+    iLink DM IDs are scoped to the logged-in Weixin account. When a tool call
+    targets a chat_id discovered from the channel directory, delivery must use
+    that entry's account_id; falling back to the source session's account_id
+    can send to a foreign-scoped DM and trigger iLink frequency-limit errors.
+    """
+    try:
+        from gateway.channel_directory import load_directory
+
+        directory = load_directory()
+    except Exception:
+        return None
+
+    account_ids = {
+        str(ch.get("account_id") or "").strip()
+        for ch in directory.get("platforms", {}).get("weixin", [])
+        if ch.get("id") == chat_id and str(ch.get("account_id") or "").strip()
+    }
+    if len(account_ids) == 1:
+        return next(iter(account_ids))
+    return None
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):

@@ -84,6 +84,7 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # Custom endpoints all share provider='custom' but are keyed by their
 # custom_providers name: 'custom:<normalized_name>'.
 CUSTOM_POOL_PREFIX = "custom:"
+CODEX_DEVICE_CODE_SOURCES = frozenset({"device_code", "manual:device_code"})
 
 
 # Fields that are only round-tripped through JSON — never used for logic as attributes.
@@ -198,6 +199,10 @@ def _next_priority(entries: List[PooledCredential]) -> int:
 def _is_manual_source(source: str) -> bool:
     normalized = (source or "").strip().lower()
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
+
+
+def _is_codex_device_code_source(source: str) -> bool:
+    return (source or "").strip().lower() in CODEX_DEVICE_CODE_SOURCES
 
 
 def _exhausted_ttl(error_code: Optional[int]) -> int:
@@ -508,11 +513,11 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  Applies to Hermes-owned
+        device-code entries; env/API-key-sourced entries have no auth.json
+        shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex" or not _is_codex_device_code_source(entry.source):
             return entry
         try:
             with _auth_store_lock():
@@ -711,10 +716,16 @@ class CredentialPool:
         whatever provider happened to refresh last, not whatever the
         user actually chose.
         """
-        # Only sync entries that were seeded *from* a singleton.  Manually
-        # added pool entries (source="manual:*") are independent credentials
-        # and must not write back to the singleton.
-        if entry.source not in {"device_code", "loopback_pkce"}:
+        # Only sync entries that are backed by singleton state. Most manual
+        # entries are independent credentials; Codex manual:device_code is the
+        # CLI auth-add shape for the same Hermes-owned device-code session.
+        if (
+            entry.source not in {"device_code", "loopback_pkce"}
+            and not (
+                self.provider == "openai-codex"
+                and _is_codex_device_code_source(entry.source)
+            )
+        ):
             return
         try:
             with _auth_store_lock():
@@ -995,10 +1006,10 @@ class CredentialPool:
                     self._persist()
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
-                # refresh_token is dead.  Clear it from auth.json so the next
+                # refresh_token is dead. Clear it from auth.json so the next
                 # session does not re-seed the same revoked credentials, and
-                # remove all singleton-seeded (device_code) entries from the
-                # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
+                # remove all Hermes-owned device-code entries from the in-memory
+                # pool. Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
@@ -1032,7 +1043,7 @@ class CredentialPool:
                         )
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if not _is_codex_device_code_source(item.source)
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1186,7 +1197,7 @@ class CredentialPool:
             # frozen behind last_error_reset_at (can be hours in the
             # future for ChatGPT weekly windows).
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
+                    and _is_codex_device_code_source(entry.source)
                     and entry.last_status == STATUS_EXHAUSTED):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:

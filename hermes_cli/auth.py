@@ -113,6 +113,7 @@ STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_DEVICE_CODE_POOL_SOURCES = frozenset({"device_code", "manual:device_code"})
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -3298,9 +3299,9 @@ def _sync_codex_pool_entries(
     OAuth pair server-side, but the pool's ``device_code`` entry keeps holding
     the now-consumed refresh token plus any stale error markers — so the next
     request spends a dead token and gets a 401 ``token_invalidated``.  Update
-    the singleton-seeded entries in lockstep with the provider tokens and clear
-    the error state so the fresh credentials take effect immediately.  Manual
-    (``manual:*``) entries are independent credentials and are left untouched.
+    the Hermes-owned device-code entries in lockstep with the provider tokens
+    and clear the error state so the fresh credentials take effect immediately.
+    Other manual entries are independent credentials and are left untouched.
     """
     access_token = tokens.get("access_token")
     if not access_token:
@@ -3313,7 +3314,7 @@ def _sync_codex_pool_entries(
     if not isinstance(entries, list):
         return
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("source") != "device_code":
+        if not isinstance(entry, dict) or entry.get("source") not in CODEX_DEVICE_CODE_POOL_SOURCES:
             continue
         entry["access_token"] = access_token
         if refresh_token:

@@ -269,6 +269,17 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
                     "last_error_reset_at": 9999999999,
                 },
                 {
+                    "id": "manual-device",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "old-manual-at",
+                    "refresh_token": "old-manual-rt",
+                    "last_status": "exhausted",
+                    "last_error_code": 401,
+                    "last_error_reason": "token_invalidated",
+                    "last_error_reset_at": 9999999999,
+                },
+                {
                     "id": "manual1",
                     "source": "manual:codex",
                     "auth_type": "oauth",
@@ -294,7 +305,16 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     assert seeded["last_error_reason"] is None
     assert seeded["last_error_reset_at"] is None
 
-    # Manual entries are independent credentials and must not be overwritten.
+    manual_device = next(e for e in pool if e["source"] == "manual:device_code")
+    assert manual_device["access_token"] == "new-at"
+    assert manual_device["refresh_token"] == "new-rt"
+    assert manual_device["last_refresh"] == "2026-05-27T00:00:00Z"
+    assert manual_device["last_status"] is None
+    assert manual_device["last_error_code"] is None
+    assert manual_device["last_error_reason"] is None
+    assert manual_device["last_error_reset_at"] is None
+
+    # Other manual entries are independent credentials and must not be overwritten.
     manual = next(e for e in pool if e["source"] == "manual:codex")
     assert manual["access_token"] == "manual-at"
     assert manual["refresh_token"] == "manual-rt"

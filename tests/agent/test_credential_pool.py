@@ -260,6 +260,69 @@ def test_exhausted_402_entry_resets_after_one_hour(tmp_path, monkeypatch):
     assert entry.last_status == "ok"
 
 
+def test_codex_manual_device_code_syncs_from_auth_store_while_exhausted(tmp_path, monkeypatch):
+    """A re-auth should unstick manual:device_code entries frozen in cooldown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "fresh-at",
+                        "refresh_token": "fresh-rt",
+                    },
+                    "last_refresh": "2026-06-04T13:30:00Z",
+                    "auth_mode": "chatgpt",
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "manual-device",
+                        "label": "manual device",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "stale-at",
+                        "refresh_token": "stale-rt",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 401,
+                        "last_error_reason": "token_expired",
+                        "last_error_reset_at": time.time() + 3600,
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.id == "manual-device"
+    assert entry.access_token == "fresh-at"
+    assert entry.refresh_token == "fresh-rt"
+    assert entry.last_status is None
+    assert entry.last_error_code is None
+    assert entry.last_error_reason is None
+    assert entry.last_error_reset_at is None
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    manual_entry = next(
+        item
+        for item in persisted["credential_pool"]["openai-codex"]
+        if item["id"] == "manual-device"
+    )
+    assert manual_entry["access_token"] == "fresh-at"
+    assert manual_entry["refresh_token"] == "fresh-rt"
+    assert manual_entry["last_status"] is None
+
+
 def test_exhausted_401_entry_resets_after_five_minutes(tmp_path, monkeypatch):
     """Transient auth failures should not strand single-key setups for an hour."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

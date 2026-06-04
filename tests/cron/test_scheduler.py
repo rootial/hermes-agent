@@ -1021,6 +1021,56 @@ class TestRunJobSessionPersistence:
         assert success is True
         cleanup_mock.assert_called_once()
 
+    def test_relay_script_output_does_not_open_session_db(self):
+        job = {
+            "id": "relay-job",
+            "name": "relay",
+            "prompt": "run",
+            "script": "relay.py",
+            "relay_script_output": True,
+        }
+
+        import cron.scheduler as scheduler
+
+        with patch.object(
+            scheduler, "_run_job_script", return_value=(True, "relay output")
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "relay output"
+        assert "relay output" in output
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_relay_script_output_failure_does_not_open_session_db(self):
+        job = {
+            "id": "relay-fail-job",
+            "name": "relay-fail",
+            "prompt": "run",
+            "script": "relay.py",
+            "relay_script_output": True,
+        }
+
+        import cron.scheduler as scheduler
+
+        with patch.object(
+            scheduler, "_run_job_script", return_value=(False, "boom")
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert error == "boom"
+        assert final_response == ""
+        assert "boom" in output
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
     def _make_run_job_patches(self, tmp_path):
         """Common patches for run_job tests."""
         fake_db = MagicMock()
@@ -2133,6 +2183,7 @@ class TestRunJobWakeGate:
 
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, '{"wakeAgent": false}')), \
+             patch("hermes_state.SessionDB") as session_db_cls, \
              patch("run_agent.AIAgent") as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -2140,6 +2191,7 @@ class TestRunJobWakeGate:
         assert err is None
         assert final == SILENT_MARKER
         assert "Script gate returned `wakeAgent=false`" in doc
+        session_db_cls.assert_not_called()
         agent_cls.assert_not_called()
 
     def test_wake_true_runs_agent_with_injected_output(self):

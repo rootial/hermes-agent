@@ -6172,8 +6172,10 @@ class GatewayRunner:
             # old gateway's connection holding the WAL lock until Python
             # actually exits — causing 'database is locked' errors when
             # the new gateway tries to open the same file.
-            for _db_holder in (self, getattr(self, "session_store", None)):
-                _db = getattr(_db_holder, "_db", None) if _db_holder else None
+            for _db in (
+                getattr(self, "_session_db", None),
+                getattr(getattr(self, "session_store", None), "_db", None),
+            ):
                 if _db is None or not hasattr(_db, "close"):
                     continue
                 try:

@@ -4168,6 +4168,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        if self._session_db is not None:
+            try:
+                self._session_db.close()
+            except Exception:
+                pass
+            self._session_db = None
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

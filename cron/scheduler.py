@@ -1380,21 +1380,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return True, doc, output, None
 
     # ---------------------------------------------------------------
-    # Default (LLM) path — import and construct the agent machinery now
-    # that we know we actually need it. Doing these imports here instead of
-    # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
-    # construction costs.
+    # Default (LLM) path. Keep the state DB and agent construction below all
+    # script-only early returns so relay_script_output ticks do not open a
+    # state.db connection that their cleanup block never reaches.
     # ---------------------------------------------------------------
-    from run_agent import AIAgent
-
-    # Initialize SQLite session store so cron job messages are persisted
-    # and discoverable via session_search (same pattern as gateway/run.py).
     _session_db = None
-    try:
-        from hermes_state import SessionDB
-        _session_db = SessionDB()
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -1722,6 +1712,16 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
             )
+
+        from run_agent import AIAgent
+
+        # Initialize SQLite session store so cron job messages are persisted
+        # and discoverable via session_search (same pattern as gateway/run.py).
+        try:
+            from hermes_state import SessionDB
+            _session_db = SessionDB()
+        except Exception as e:
+            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
         agent = AIAgent(
             model=model,

@@ -422,6 +422,18 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+@pytest.mark.asyncio
+async def test_disconnect_closes_session_db():
+    adapter = _make_adapter()
+    db = MagicMock()
+    adapter._session_db = db
+
+    await adapter.disconnect()
+
+    db.close.assert_called_once()
+    assert adapter._session_db is None
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()

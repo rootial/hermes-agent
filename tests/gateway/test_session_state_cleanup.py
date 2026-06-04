@@ -174,13 +174,15 @@ class TestSessionDbCloseOnShutdown:
         runner_db = MagicMock()
         store_db = MagicMock()
 
-        runner._db = runner_db
+        runner._session_db = runner_db
         runner.session_store = MagicMock()
         runner.session_store._db = store_db
 
         # Replicate the exact production loop from _stop_impl.
-        for _db_holder in (runner, getattr(runner, "session_store", None)):
-            _db = getattr(_db_holder, "_db", None) if _db_holder else None
+        for _db in (
+            getattr(runner, "_session_db", None),
+            getattr(getattr(runner, "session_store", None), "_db", None),
+        ):
             if _db is None or not hasattr(_db, "close"):
                 continue
             _db.close()
@@ -193,16 +195,18 @@ class TestSessionDbCloseOnShutdown:
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
-        runner._db = MagicMock()
+        runner._session_db = MagicMock()
         # Deliberately no session_store attribute.
 
-        for _db_holder in (runner, getattr(runner, "session_store", None)):
-            _db = getattr(_db_holder, "_db", None) if _db_holder else None
+        for _db in (
+            getattr(runner, "_session_db", None),
+            getattr(getattr(runner, "session_store", None), "_db", None),
+        ):
             if _db is None or not hasattr(_db, "close"):
                 continue
             _db.close()
 
-        runner._db.close.assert_called_once()
+        runner._session_db.close.assert_called_once()
 
     def test_shutdown_tolerates_close_raising(self):
         """A close() that raises must not prevent subsequent cleanup."""
@@ -213,13 +217,15 @@ class TestSessionDbCloseOnShutdown:
         flaky_db.close.side_effect = RuntimeError("simulated lock error")
         healthy_db = MagicMock()
 
-        runner._db = flaky_db
+        runner._session_db = flaky_db
         runner.session_store = MagicMock()
         runner.session_store._db = healthy_db
 
         # Same pattern as production: try/except around each close().
-        for _db_holder in (runner, getattr(runner, "session_store", None)):
-            _db = getattr(_db_holder, "_db", None) if _db_holder else None
+        for _db in (
+            getattr(runner, "_session_db", None),
+            getattr(getattr(runner, "session_store", None), "_db", None),
+        ):
             if _db is None or not hasattr(_db, "close"):
                 continue
             try:

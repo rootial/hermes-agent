@@ -3497,11 +3497,16 @@ class GatewayRunner:
                 continue
 
             try:
-                metadata = {"thread_id": home.thread_id} if home.thread_id else None
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                metadata = {}
+                if home.thread_id:
+                    metadata["thread_id"] = home.thread_id
+                if getattr(home, "account_id", None):
+                    metadata["account_id"] = home.account_id
+                result = await adapter.send(
+                    str(home.chat_id),
+                    msg,
+                    metadata=metadata or None,
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
@@ -11097,7 +11102,10 @@ class GatewayRunner:
         # Save to .env so it persists across restarts
         try:
             from hermes_cli.config import save_env_value
-            save_env_value(env_key, str(chat_id))
+            home_value = str(chat_id)
+            if platform_name == "weixin" and getattr(source, "account_id", None):
+                home_value = f"{source.account_id}:{chat_id}"
+            save_env_value(env_key, home_value)
             # Keep thread/topic routing explicit and clear stale values when
             # /sethome is run from the parent chat instead of a thread.
             save_env_value(thread_env_key, str(thread_id or ""))
@@ -11116,6 +11124,7 @@ class GatewayRunner:
                 chat_id=str(chat_id),
                 name=chat_name,
                 thread_id=str(thread_id) if thread_id else None,
+                account_id=str(source.account_id) if source.account_id else None,
             )
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
@@ -14554,11 +14563,16 @@ class GatewayRunner:
                 continue
 
             try:
-                metadata = {"thread_id": home.thread_id} if home.thread_id else None
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), message, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), message)
+                metadata = {}
+                if home.thread_id:
+                    metadata["thread_id"] = home.thread_id
+                if getattr(home, "account_id", None):
+                    metadata["account_id"] = home.account_id
+                result = await adapter.send(
+                    str(home.chat_id),
+                    message,
+                    metadata=metadata or None,
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",

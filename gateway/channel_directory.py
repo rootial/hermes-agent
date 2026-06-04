@@ -89,6 +89,13 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
+            elif platform == Platform.WEIXIN:
+                account_ids = {
+                    str(getattr(account, "account_id", "")).strip()
+                    for account in getattr(adapter, "_accounts", [])
+                    if str(getattr(account, "account_id", "")).strip()
+                }
+                platforms["weixin"] = _build_from_sessions("weixin", active_account_ids=account_ids)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -224,7 +231,11 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     return channels
 
 
-def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
+def _build_from_sessions(
+    platform_name: str,
+    *,
+    active_account_ids: Optional[set[str]] = None,
+) -> List[Dict[str, str]]:
     """Pull known channels/contacts from sessions.json origin data."""
     sessions_path = get_hermes_home() / "sessions" / "sessions.json"
     if not sessions_path.exists():
@@ -240,6 +251,9 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             origin = session.get("origin") or {}
             if origin.get("platform") != platform_name:
                 continue
+            account_id = str(origin.get("account_id") or "").strip()
+            if active_account_ids is not None and account_id and account_id not in active_account_ids:
+                continue
             entry_id = _session_entry_id(origin)
             dedupe_key = _session_dedupe_key(origin)
             if not entry_id or not dedupe_key or dedupe_key in seen_ids:
@@ -251,7 +265,6 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
                 "type": session.get("chat_type", "dm"),
                 "thread_id": origin.get("thread_id"),
             }
-            account_id = str(origin.get("account_id") or "").strip()
             if account_id:
                 entry["account_id"] = account_id
             entries.append(entry)

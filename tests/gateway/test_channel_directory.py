@@ -316,6 +316,33 @@ class TestBuildFromSessions:
         assert len(entries) == 2
         assert {entry["account_id"] for entry in entries} == {"bot-a@im.bot", "bot-b@im.bot"}
 
+    def test_weixin_active_account_filter_skips_removed_accounts(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "active": {
+                "origin": {
+                    "platform": "weixin",
+                    "account_id": "active@im.bot",
+                    "chat_id": "wxid_active",
+                    "chat_name": "Active",
+                },
+                "chat_type": "dm",
+            },
+            "removed": {
+                "origin": {
+                    "platform": "weixin",
+                    "account_id": "removed@im.bot",
+                    "chat_id": "wxid_removed",
+                    "chat_name": "Removed",
+                },
+                "chat_type": "dm",
+            },
+        })
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("weixin", active_account_ids={"active@im.bot"})
+
+        assert [entry["id"] for entry in entries] == ["wxid_active"]
+
 
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):

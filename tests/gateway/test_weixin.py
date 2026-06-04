@@ -462,6 +462,43 @@ class TestWeixinChunkDelivery:
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_with_context_token_retries_without_token(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        discard_mock = Mock()
+        adapter._accounts[0].token_store.discard = discard_mock
+        send_message_mock.side_effect = [
+            {"ret": weixin.RATE_LIMIT_ERRCODE, "errmsg": "rate limited"},
+            {"ret": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        assert send_message_mock.await_args_list[0].kwargs["context_token"] == "ctx-token"
+        assert send_message_mock.await_args_list[1].kwargs["context_token"] is None
+        discard_mock.assert_called_once_with("test-account", "wxid_test123")
+        sleep_mock.assert_not_awaited()
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_tokenless_rate_limit_error_mentions_reply_window(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0
+        adapter._accounts[0].token_store.get = lambda account_id, chat_id: None
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "rate limited",
+        }
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "fresh message" in result.error
+        sleep_mock.assert_not_awaited()
+
 
 class TestWeixinOutboundMedia:
     def test_send_image_file_accepts_keyword_image_path(self):

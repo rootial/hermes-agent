@@ -347,6 +347,10 @@ class ContextTokenStore:
         self._cache[self._key(account_id, user_id)] = token
         self._persist(account_id)
 
+    def discard(self, account_id: str, user_id: str) -> None:
+        self._cache.pop(self._key(account_id, user_id), None)
+        self._persist(account_id)
+
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
         payload = {
@@ -1877,26 +1881,42 @@ class WeixinAdapter(BasePlatformAdapter):
                         if is_session_expired and not retried_without_token and context_token:
                             retried_without_token = True
                             context_token = None
-                            state.token_store._cache.pop(
-                                state.token_store._key(state.account_id, chat_id), None
-                            )
+                            state.token_store.discard(state.account_id, chat_id)
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
                                 self.name, _safe_id(chat_id),
                             )
                             continue
-                        # Rate limit (-2) — backoff and retry
+                        # Rate limit (-2) — first strip a cached context token.
+                        # iLink can report an old context_token as a frequency
+                        # limit; tokenless delivery is the same degraded
+                        # fallback used for explicit session expiry.
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
                             or errcode == RATE_LIMIT_ERRCODE
                         )
                         if is_rate_limited:
                             errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
+                            if not retried_without_token and context_token:
+                                retried_without_token = True
+                                context_token = None
+                                state.token_store.discard(state.account_id, chat_id)
+                                logger.warning(
+                                    "[%s] rate limited for %s with context_token; retrying without context_token",
+                                    self.name, _safe_id(chat_id),
+                                )
+                                continue
+                            guidance = ""
+                            if context_token is None:
+                                guidance = (
+                                    "; target may need to send Owl a fresh message "
+                                    "to reopen the iLink reply window"
+                                )
                             # Record the error so we raise a descriptive
                             # RuntimeError (instead of AssertionError) if the
                             # loop exhausts with the server still rate-limiting.
                             last_error = RuntimeError(
-                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}{guidance}"
                             )
                             if attempt >= self._send_chunk_retries:
                                 break

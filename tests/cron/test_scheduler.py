@@ -1236,6 +1236,40 @@ class TestRunJobSessionPersistence:
         assert success is True
         cleanup_mock.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("script_result", "expected_success", "expected_error"),
+        [
+            ((True, "relay output"), True, None),
+            ((False, "boom"), False, "boom"),
+        ],
+    )
+    def test_relay_script_output_does_not_open_session_db(
+        self, script_result, expected_success, expected_error
+    ):
+        job = {
+            "id": "relay-job",
+            "name": "relay",
+            "prompt": "run",
+            "script": "relay.py",
+            "relay_script_output": True,
+        }
+
+        import cron.scheduler as scheduler
+
+        with patch.object(
+            scheduler, "_run_job_script", return_value=script_result
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is expected_success
+        assert error == expected_error
+        assert script_result[1] in output
+        assert final_response == (script_result[1] if expected_success else "")
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
         """Apply every patch run_job tests need, as one bundle.
@@ -2887,6 +2921,7 @@ class TestRunJobWakeGate:
 
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, '{"wakeAgent": false}')), \
+             patch("hermes_state.SessionDB") as session_db_cls, \
              patch("run_agent.AIAgent") as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -2894,6 +2929,7 @@ class TestRunJobWakeGate:
         assert err is None
         assert final == SILENT_MARKER
         assert "Script gate returned `wakeAgent=false`" in doc
+        session_db_cls.assert_not_called()
         agent_cls.assert_not_called()
 
     def test_wake_true_runs_agent_with_injected_output(self):

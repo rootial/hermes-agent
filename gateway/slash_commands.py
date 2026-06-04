@@ -2434,7 +2434,10 @@ class GatewaySlashCommandsMixin:
         # Save to .env so it persists across restarts
         try:
             from hermes_cli.config import save_env_value
-            save_env_value(env_key, str(chat_id))
+            home_value = str(chat_id)
+            if platform_name == "weixin" and source.account_id:
+                home_value = f"{source.account_id}:{chat_id}"
+            save_env_value(env_key, home_value)
             # Keep thread/topic routing explicit and clear stale values when
             # /sethome is run from the parent chat instead of a thread.
             save_env_value(thread_env_key, str(thread_id or ""))
@@ -2453,6 +2456,7 @@ class GatewaySlashCommandsMixin:
                 chat_id=str(chat_id),
                 name=chat_name,
                 thread_id=str(thread_id) if thread_id else None,
+                account_id=str(source.account_id) if source.account_id else None,
             )
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)

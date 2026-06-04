@@ -5884,7 +5884,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.chat_id,
                     home.thread_id,
                     adapter=adapter,
-                )
+                ) or {}
+                if getattr(home, "account_id", None):
+                    metadata["account_id"] = home.account_id
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 else:
@@ -12800,7 +12802,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
 
-
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
         """Extract Discord guild_id from the raw message object."""
@@ -14870,7 +14871,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.chat_id,
                     home.thread_id,
                     adapter=adapter,
-                )
+                ) or {}
+                if getattr(home, "account_id", None):
+                    metadata["account_id"] = home.account_id
                 if metadata:
                     result = await adapter.send(
                         str(home.chat_id),

@@ -4419,7 +4419,11 @@ class GatewayRunner:
         
         return True
 
-    async def _handoff_watcher(self, interval: float = 2.0) -> None:
+    async def _handoff_watcher(
+        self,
+        interval: float = 2.0,
+        initial_delay: float = 5.0,
+    ) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
 
         Polls ``state.db`` for sessions in ``handoff_state='pending'`` and,
@@ -4440,29 +4444,33 @@ class GatewayRunner:
         """
         # Initial delay so the gateway is fully connected to its platforms
         # before we try to dispatch handoffs through them.
-        await asyncio.sleep(5)
+        await asyncio.sleep(initial_delay)
         while self._running:
             try:
-                if self._session_db is None:
+                session_db = self._session_db
+                if session_db is None:
                     await asyncio.sleep(interval)
                     continue
-                pending = self._session_db.list_pending_handoffs()
+                # SQLite can wait on WAL/write locks. Keep that wait off the
+                # gateway loop so platform heartbeats and inbound messages stay
+                # live even when state.db is contended.
+                pending = await asyncio.to_thread(session_db.list_pending_handoffs)
                 for row in pending:
                     session_id = row.get("id")
                     if not session_id:
                         continue
-                    if not self._session_db.claim_handoff(session_id):
+                    if not await asyncio.to_thread(session_db.claim_handoff, session_id):
                         # Another tick or another gateway already claimed it.
                         continue
                     try:
                         await self._process_handoff(row)
-                        self._session_db.complete_handoff(session_id)
+                        await asyncio.to_thread(session_db.complete_handoff, session_id)
                     except Exception as exc:
                         logger.warning(
                             "Handoff for session %s failed: %s",
                             session_id, exc, exc_info=True,
                         )
-                        self._session_db.fail_handoff(session_id, str(exc))
+                        await asyncio.to_thread(session_db.fail_handoff, session_id, str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

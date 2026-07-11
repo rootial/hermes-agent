@@ -83,6 +83,7 @@ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
 # drift apart.
 TICKER_INTERVAL_SECONDS = 60
+FIRST_RUN_PENDING_STATUS = "pending"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -387,6 +388,24 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _should_mark_pending_first_run(job: Dict[str, Any]) -> bool:
+    """Return whether an enabled job is waiting for its first recorded run."""
+    return (
+        job.get("enabled", True)
+        and job.get("state") != "paused"
+        and job.get("last_run_at") is None
+        and job.get("last_status") in (None, "")
+    )
+
+
+def _normalize_pending_first_run(job: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(job)
+    if _should_mark_pending_first_run(normalized):
+        normalized["last_status"] = FIRST_RUN_PENDING_STATUS
+        normalized["last_error"] = None
+    return normalized
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -419,7 +438,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
 
-    return normalized
+    return _normalize_pending_first_run(normalized)
 
 
 def _secure_dir(path: Path):
@@ -850,18 +869,21 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
+        normalized_jobs = [_normalize_pending_first_run(job) for job in jobs]
+        if (_strict_retry and jobs) or normalized_jobs != jobs:
+            # Repair invalid escaping and migrate explicit first-run status.
+            save_jobs(normalized_jobs)
         if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        return jobs
+        return normalized_jobs
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
+        normalized_jobs = [_normalize_pending_first_run(job) for job in data]
         if data:
-            save_jobs(data)
+            save_jobs(normalized_jobs)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
+        return normalized_jobs
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
@@ -1205,7 +1227,7 @@ def create_job(
         "created_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,
-        "last_status": None,
+        "last_status": FIRST_RUN_PENDING_STATUS,
         "last_error": None,
         "last_delivery_error": None,
         # Delivery configuration
@@ -1378,6 +1400,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            updated = _normalize_pending_first_run(updated)
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -1421,6 +1444,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": next_run_at,
+            "last_status": job.get("last_status") or FIRST_RUN_PENDING_STATUS,
         },
     )
 

@@ -1333,12 +1333,7 @@ class TestRunJobSessionPersistence:
             "  max_tokens: 8192\n",
             encoding="utf-8",
         )
-        fake_db, patches = self._make_run_job_patches(tmp_path)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
@@ -1358,12 +1353,7 @@ class TestRunJobSessionPersistence:
             "  max_tokens: 8192\n",
             encoding="utf-8",
         )
-        fake_db, patches = self._make_run_job_patches(tmp_path)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs

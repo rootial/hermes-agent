@@ -1652,7 +1652,11 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
 
-    async def _process_message(self, message: Dict[str, Any], state: _AccountState) -> None:
+    async def _process_message(
+        self, message: Dict[str, Any], state: Optional[_AccountState] = None
+    ) -> None:
+        if state is None:
+            state = self._resolve_account_state()
         assert self._poll_session is not None
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id:
@@ -1990,6 +1994,7 @@ class WeixinAdapter(BasePlatformAdapter):
         """
         async with self._send_text_gate:
             await self._send_text_chunk_locked(
+                state=state,
                 chat_id=chat_id,
                 chunk=chunk,
                 context_token=context_token,
@@ -1999,6 +2004,7 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _send_text_chunk_locked(
         self,
         *,
+        state: _AccountState,
         chat_id: str,
         chunk: str,
         context_token: Optional[str],
@@ -2293,13 +2299,15 @@ class WeixinAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         del reply_to, kwargs
-        return await self.send_document(
-            chat_id=chat_id,
-            file_path=image_path,
-            caption=caption,
-            metadata=metadata,
-            account_id=account_id,
-        )
+        send_kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "file_path": image_path,
+            "caption": caption,
+            "metadata": metadata,
+        }
+        if account_id is not None:
+            send_kwargs["account_id"] = account_id
+        return await self.send_document(**send_kwargs)
 
     async def send_document(
         self,
@@ -2319,7 +2327,10 @@ class WeixinAdapter(BasePlatformAdapter):
             state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
             if not state.token:
                 return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
-            message_id = await self._send_file(chat_id, file_path, caption or "", state)
+            if account_id is None and not (metadata or {}).get("account_id"):
+                message_id = await self._send_file(chat_id, file_path, caption or "")
+            else:
+                message_id = await self._send_file(chat_id, file_path, caption or "", state)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
@@ -2366,12 +2377,11 @@ class WeixinAdapter(BasePlatformAdapter):
             state = self._resolve_account_state(account_id=account_id, chat_id=chat_id, metadata=metadata)
             if not state.token:
                 return SendResult(success=False, error=f"Weixin account {state.account_id} is missing token")
+            send_args: list[Any] = [chat_id, audio_path, fallback_caption]
+            if account_id is not None or (metadata or {}).get("account_id"):
+                send_args.append(state)
             message_id = await self._send_file(
-                chat_id,
-                audio_path,
-                fallback_caption,
-                state,
-                force_file_attachment=True,
+                *send_args, force_file_attachment=True
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -2402,9 +2412,11 @@ class WeixinAdapter(BasePlatformAdapter):
         chat_id: str,
         path: str,
         caption: str,
-        state: _AccountState,
+        state: Optional[_AccountState] = None,
         force_file_attachment: bool = False,
     ) -> str:
+        if state is None:
+            state = self._resolve_account_state(chat_id=chat_id)
         assert self._send_session is not None and state.token is not None
         plaintext = Path(path).read_bytes()
         media_type, item_builder = self._outbound_media_builder(path, force_file_attachment=force_file_attachment)

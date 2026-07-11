@@ -13,6 +13,7 @@ import re
 import ssl
 import time
 from email.utils import formatdate
+from typing import Optional
 
 from agent.redact import redact_sensitive_text
 
@@ -524,8 +525,9 @@ def _handle_send(args):
         send_kwargs = {
             "thread_id": thread_id,
             "media_files": media_files,
-            "force_document": force_document_attachments,
         }
+        if platform != Platform.WEIXIN:
+            send_kwargs["force_document"] = force_document_attachments
         if account_id:
             send_kwargs["account_id"] = account_id
         result = _run_async(
@@ -866,7 +868,10 @@ async def _send_to_platform(
     # so a Weixin send is not blocked by unrelated optional dependencies (for
     # example lark-oapi's heavy Feishu import path).
     if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+        weixin_kwargs = {"media_files": media_files}
+        if account_id:
+            weixin_kwargs["account_id"] = account_id
+        return await _send_weixin(pconfig, chat_id, message, **weixin_kwargs)
 
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
 
@@ -930,16 +935,6 @@ async def _send_to_platform(
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
-        )
-
-    # --- Weixin: use the native one-shot adapter helper for text + media ---
-    if platform == Platform.WEIXIN:
-        return await _send_weixin(
-            pconfig,
-            chat_id,
-            message,
-            media_files=media_files,
-            account_id=account_id,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.

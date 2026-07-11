@@ -40,10 +40,13 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -250,7 +253,18 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    temp_parent = Path(tempfile.gettempdir()) / f"hermes-pytest-{os.getpid()}"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    file_key = hashlib.sha256(str(file.resolve()).encode("utf-8")).hexdigest()[:16]
+    pytest_basetemp = temp_parent / file_key
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        *pytest_args,
+        f"--basetemp={pytest_basetemp}",
+    ]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -313,6 +327,11 @@ def _run_one_file(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    shutil.rmtree(pytest_basetemp, ignore_errors=True)
+    try:
+        temp_parent.rmdir()
+    except OSError:
+        pass
     return file, rc, output, summary, subproc_wall
 
 

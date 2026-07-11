@@ -277,3 +277,41 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     # Discovery found the probe file (2 tests), proving the positional path
     # was consumed as a root, not forwarded to pytest as a bad flag.
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
+
+
+def test_parallel_files_use_isolated_pytest_temp_roots(tmp_path: Path) -> None:
+    """Concurrent pytest startup cleanup must not remove another file's tmp_path."""
+    probe_dir = tmp_path / "temp-root-probes"
+    probe_dir.mkdir()
+    for index in range(8):
+        (probe_dir / f"test_temp_root_{index}.py").write_text(
+            "import time\n"
+            "def test_tmp_path_survives_parallel_startup(tmp_path):\n"
+            "    marker = tmp_path / 'marker'\n"
+            "    marker.write_text('ok')\n"
+            "    time.sleep(0.5)\n"
+            "    assert marker.read_text() == 'ok'\n",
+            encoding="utf-8",
+        )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "8",
+            "--file-timeout",
+            "30",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout

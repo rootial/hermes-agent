@@ -88,6 +88,12 @@ def _is_alive_like_dispatcher(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+    except ChildProcessError:
+        return False
+    try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False

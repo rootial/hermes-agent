@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 import textwrap
 from pathlib import Path
 
+import pytest
+
 
 _PATCHER = Path("plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs")
+pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required")
 
 
 def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:

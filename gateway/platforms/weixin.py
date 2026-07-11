@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -1690,7 +1691,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             if state.group_policy == "pairing":
                 return
-        elif not self._is_dm_allowed(sender_id, state):
+        elif not self._is_dm_intake_allowed(sender_id, state):
             return
 
         context_token = str(message.get("context_token") or "").strip()
@@ -1739,16 +1740,32 @@ class WeixinAdapter(BasePlatformAdapter):
             return True
         return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
-    def _is_dm_allowed(self, sender_id: str, state: _AccountState) -> bool:
+    def _dm_account_state(self, state: Optional[_AccountState]) -> Any:
+        if state is not None:
+            return state
+        if hasattr(self, "_accounts"):
+            return self._resolve_account_state()
+        return SimpleNamespace(dm_policy=self._dm_policy, allow_from=self._allow_from)
+
+    def _is_dm_allowed(
+        self, sender_id: str, state: Optional[_AccountState] = None
+    ) -> bool:
+        state = self._dm_account_state(state)
         if state.dm_policy == "disabled":
             return False
         if state.dm_policy == "allowlist":
             return sender_id in state.allow_from
-        if state.dm_policy == "pairing":
-            return True
         if state.dm_policy == "open":
             return self._open_dm_opted_in()
         return False
+
+    def _is_dm_intake_allowed(
+        self, sender_id: str, state: Optional[_AccountState] = None
+    ) -> bool:
+        state = self._dm_account_state(state)
+        if state.dm_policy == "pairing":
+            return True
+        return self._is_dm_allowed(sender_id, state)
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -2197,7 +2214,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _ensure_typing_ticket(
-        self, chat_id: str, state: _AccountState
+        self, chat_id: str, state: Optional[_AccountState] = None
     ) -> Optional[str]:
         """Return a valid typing ticket, refreshing from getConfig if expired.
 
@@ -2208,6 +2225,8 @@ class WeixinAdapter(BasePlatformAdapter):
         method transparently refreshes the ticket so the stop signal can
         always be delivered.
         """
+        if state is None:
+            state = self._resolve_typing_account_state(chat_id)
         ticket = state.typing_cache.get(chat_id)
         if ticket:
             return ticket
@@ -2235,11 +2254,27 @@ class WeixinAdapter(BasePlatformAdapter):
             )
         return None
 
+    def _resolve_typing_account_state(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Resolve typing state while preserving the legacy single-account surface."""
+        if hasattr(self, "_accounts"):
+            return self._resolve_account_state(chat_id=chat_id, metadata=metadata)
+        return SimpleNamespace(
+            account_id=self._account_id,
+            token=self._token,
+            base_url=self._base_url,
+            token_store=self._token_store,
+            typing_cache=self._typing_cache,
+        )
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._send_session:
             return
         try:
-            state = self._resolve_account_state(chat_id=chat_id, metadata=metadata)
+            state = self._resolve_typing_account_state(chat_id, metadata)
         except Exception:
             return
         typing_ticket = await self._ensure_typing_ticket(chat_id, state)
@@ -2261,7 +2296,7 @@ class WeixinAdapter(BasePlatformAdapter):
         if not self._send_session:
             return
         try:
-            state = self._resolve_account_state(chat_id=chat_id)
+            state = self._resolve_typing_account_state(chat_id)
         except Exception:
             return
         typing_ticket = await self._ensure_typing_ticket(chat_id, state)

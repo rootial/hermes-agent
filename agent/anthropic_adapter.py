@@ -903,12 +903,15 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         return None
 
     raw = result.stdout.strip()
+    if not isinstance(raw, (str, bytes, bytearray)):
+        logger.debug("Keychain: credentials payload has an unexpected type")
+        return None
     if not raw:
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 

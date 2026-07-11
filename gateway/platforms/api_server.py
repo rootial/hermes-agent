@@ -4879,22 +4879,24 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
-        if self._response_store is not None:
+        response_store = getattr(self, "_response_store", None)
+        if response_store is not None:
             try:
-                self._response_store.close()
+                response_store.close()
             except Exception:
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
-        if self._site:
+        if getattr(self, "_site", None):
             await self._site.stop()
             self._site = None
-        if self._runner:
+        if getattr(self, "_runner", None):
             await self._runner.cleanup()
             self._runner = None
-        if self._session_db is not None:
+        session_db = getattr(self, "_session_db", None)
+        if session_db is not None:
             try:
-                self._session_db.close()
+                session_db.close()
             except Exception:
                 pass
             self._session_db = None

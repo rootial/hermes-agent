@@ -907,7 +907,8 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
-    account_prefix = f":{source.account_id}" if source.account_id else ""
+    account_id = getattr(source, "account_id", None)
+    account_prefix = f":{account_id}" if account_id else ""
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:

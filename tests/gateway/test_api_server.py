@@ -605,6 +605,11 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
+
+    async def _close_adapter(_app):
+        await adapter.disconnect()
+
+    app.on_cleanup.append(_close_adapter)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
@@ -2480,21 +2485,20 @@ class TestResponsesStreaming:
                     },
                 )
                 body = await resp.text()
+            response_id = None
+            for line in body.splitlines():
+                if line.startswith("data: "):
+                    try:
+                        payload = json.loads(line[len("data: "):])
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("type") == "response.completed":
+                        response_id = payload["response"]["id"]
+                        break
+            assert response_id
+            stored_history = adapter._response_store.get(response_id)["conversation_history"]
 
         assert resp.status == 200
-        response_id = None
-        for line in body.splitlines():
-            if line.startswith("data: "):
-                try:
-                    payload = json.loads(line[len("data: "):])
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("type") == "response.completed":
-                    response_id = payload["response"]["id"]
-                    break
-
-        assert response_id
-        stored_history = adapter._response_store.get(response_id)["conversation_history"]
         assert stored_history == expected_history
         assert stored_history.count(prior_history[0]) == 1
         assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1

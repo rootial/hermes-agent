@@ -2083,7 +2083,9 @@ class WeixinAdapter(BasePlatformAdapter):
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}{guidance}"
                             )
                             if self._record_rate_limit_event():
-                                last_error = self._rate_limit_error()
+                                last_error = RuntimeError(
+                                    f"{last_error}; {self._rate_limit_error()}"
+                                )
                                 break
                             if attempt >= self._send_chunk_retries:
                                 break

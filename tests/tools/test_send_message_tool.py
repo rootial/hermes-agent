@@ -632,7 +632,6 @@ class TestSendMessageTool:
             "hello",
             thread_id=None,
             media_files=[],
-            force_document=False,
             account_id="bot-b@im.bot",
         )
 
@@ -685,7 +684,6 @@ class TestSendMessageTool:
             "hello",
             thread_id=None,
             media_files=[],
-            force_document=False,
             account_id="bot-c@im.bot",
         )
 
@@ -721,7 +719,6 @@ class TestSendMessageTool:
             "hello",
             thread_id=None,
             media_files=[],
-            force_document=False,
             account_id="bot-b@im.bot",
         )
 
@@ -769,7 +766,6 @@ class TestSendMessageTool:
             "hello",
             thread_id=None,
             media_files=[],
-            force_document=False,
             account_id="bot-c@im.bot",
         )
 
@@ -804,7 +800,6 @@ class TestSendMessageTool:
             "hello",
             thread_id=None,
             media_files=[],
-            force_document=False,
             account_id="bot-b@im.bot",
         )
 

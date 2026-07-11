@@ -471,6 +471,7 @@ class TestWeixinChunkDelivery:
         adapter._rate_limit_circuit_threshold = 2
         adapter._rate_limit_circuit_window_seconds = 60
         adapter._rate_limit_circuit_open_seconds = 60
+        adapter._accounts[0].token_store.get = lambda account_id, chat_id: None
 
         send_message_mock.return_value = {
             "ret": weixin.RATE_LIMIT_ERRCODE,
@@ -523,6 +524,7 @@ class TestWeixinChunkDelivery:
         adapter._send_chunk_retry_delay_seconds = 0
         adapter._rate_limit_circuit_threshold = 1
         adapter._rate_limit_circuit_open_seconds = 60
+        adapter._accounts[0].token_store.get = lambda account_id, chat_id: None
         active = 0
         peak_active = 0
 

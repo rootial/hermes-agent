@@ -168,13 +168,15 @@ class TestBasePlatformTopicSessions:
         adapter._pending_messages[session_key] = queued_event
 
         await adapter._process_message_background(event, session_key)
+        drain_task = adapter._session_tasks[session_key]
+        await drain_task
 
         assert adapter.sent == [
             {
                 "chat_id": "-1001",
                 "content": "ack",
-                "reply_to": "2",
-                "metadata": {"thread_id": "17585"},
+                "reply_to": None,
+                "metadata": {"thread_id": "17585", "notify": True},
             }
         ]
         assert adapter.processing_hooks == [

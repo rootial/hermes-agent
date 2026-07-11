@@ -1139,7 +1139,7 @@ class TestLaunchdServiceRecovery:
         assert gateway_cli._launchd_unsupported_marker_exists()
 
     def test_launchd_restart_falls_back_to_detached_on_error_5(self, monkeypatch, capsys):
-        """kickstart -k error 5 (domain unmanageable) should relaunch detached."""
+        """Repeated bootstrap error 5 should relaunch detached."""
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
@@ -1149,7 +1149,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
         def fake_run(cmd, check=False, **kwargs):
-            if cmd == ["launchctl", "kickstart", "-k", target]:
+            if cmd[:2] == ["launchctl", "bootstrap"]:
                 raise gateway_cli.subprocess.CalledProcessError(
                     5, cmd, stderr="Input/output error"
                 )
@@ -1201,7 +1201,6 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_restart()
 
         assert calls == [
-            ["launchctl", "kickstart", "-k", target],
             ["launchctl", "bootout", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
@@ -1571,6 +1570,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _isolate_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 

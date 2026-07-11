@@ -718,8 +718,12 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         if not tokens:
             return False
-        for tok in tokens:
+        for index, tok in enumerate(tokens):
             head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            # ``skill`` is also a common search/content argument. Treat it as
+            # the Solaris process-killer only when it is the executable.
+            if head == "skill" and index != 0:
+                continue
             if head in _PROCESS_KILLERS:
                 low = cmd_str.lower()
                 # pkill -f pattern: catch hermes-themed patterns + a

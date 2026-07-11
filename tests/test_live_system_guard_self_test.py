@@ -283,6 +283,16 @@ def test_normal_subprocess_run_passes_through():
     assert r.stdout.strip() == "hello"
 
 
+def test_skill_as_subprocess_argument_passes_through():
+    """The content word 'skill' must not be parsed as the process-killer command."""
+    r = subprocess.run(
+        ["echo", "real skill", "/tmp/hermes-test"],
+        capture_output=True,
+        text=True,
+    )
+    assert "real skill" in r.stdout
+
+
 # ──────────────────── bypass marker ─────────────────────────────
 
 

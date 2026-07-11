@@ -6789,8 +6789,10 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         return False
 
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> bool:
     """Check if fork is behind upstream and sync if safe.
+
+    Returns True when upstream changes were applied locally.
 
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
@@ -6803,7 +6805,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     if not has_upstream:
         # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return False
 
         # Ask user if they want to add upstream
         print()
@@ -6827,13 +6829,13 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return False
         else:
             print(
                 "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
             )
             _mark_skip_upstream_prompt()
-            return
+            return False
 
     # Fetch upstream main only. This sync compares upstream/main with
     # origin/main, so there's no reason to pull every upstream ref — and a bare
@@ -6849,7 +6851,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         )
     except subprocess.CalledProcessError:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+        return False
 
     # Compare origin/main with upstream/main
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
@@ -6859,40 +6861,55 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
-
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
+        return False
 
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return
+        if origin_ahead > 0:
+            print(f"  ✓ Fork is up to date with upstream ({origin_ahead} local commit(s) on top)")
+        else:
+            print("  ✓ Fork is up to date with upstream")
+        return False
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
     print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
+    suffix = f", {origin_ahead} local commit(s) on top" if origin_ahead else ""
+    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream{suffix}")
 
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
-        return
-
-    print("  ✓ Updated from upstream")
+    if origin_ahead > 0:
+        print("→ Rebasing local commits onto upstream/main...")
+        try:
+            subprocess.run(
+                git_cmd + ["rebase", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            subprocess.run(
+                git_cmd + ["rebase", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            print("  ✗ Rebase conflict. Aborted automatically.")
+            print(f"  Resolve manually in {cwd}:")
+            print("    git rebase upstream/main")
+            return False
+        print(f"  ✓ Rebased {origin_ahead} local commit(s) onto upstream/main")
+    else:
+        print("→ Pulling from upstream...")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print("  ✗ Failed to pull from upstream.")
+            return False
+        print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
@@ -6903,6 +6920,8 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
         )
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
+    return True
 
 
 def _invalidate_update_cache():
@@ -9659,6 +9678,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
+        # Sync fork commits onto upstream before comparing against origin.
+        # The working tree is clean here because local edits were stashed above.
+        fork_synced_upstream = False
+        if is_fork and branch == "main":
+            fork_synced_upstream = _sync_with_upstream_if_needed(
+                git_cmd, PROJECT_ROOT
+            )
+
         # Check if there are updates
         result = subprocess.run(
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
@@ -9669,12 +9696,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        if commit_count == 0 and not fork_synced_upstream:
             _invalidate_update_cache()
-
-            # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
-                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:
@@ -9882,10 +9905,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
-
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

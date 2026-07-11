@@ -610,6 +610,25 @@ def compress_context(
                 _existing_sp = agent._build_system_prompt(system_message)
             return messages, _existing_sp
         if _lock_holder is not None:
+            try:
+                _locked_session = _lock_db.get_session(_lock_sid)
+            except Exception:
+                _locked_session = None
+            if _locked_session and _locked_session.get("end_reason") == "compression":
+                logger.warning(
+                    "compression skipped: session=%s already rotated while waiting for lock",
+                    _lock_sid,
+                )
+                try:
+                    _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+                except Exception:
+                    pass
+                _lock_holder = None
+                _existing_sp = getattr(agent, "_cached_system_prompt", None)
+                if not _existing_sp:
+                    _existing_sp = agent._build_system_prompt(system_message)
+                return messages, _existing_sp
+        if _lock_holder is not None:
             _lock_refresher = _CompressionLockLeaseRefresher(
                 _lock_db,
                 _lock_sid,

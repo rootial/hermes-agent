@@ -173,6 +173,23 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     )
 
 
+def test_stale_parent_is_not_rotated_twice(tmp_path: Path) -> None:
+    """A delayed compressor must observe that the parent already rotated."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "STALE_PARENT_TEST_SESSION"
+    db.create_session(parent_sid, source="discord")
+    first = _build_agent_with_db(db, parent_sid)
+    delayed = _build_agent_with_db(db, parent_sid)
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    first._compress_context(messages, "sys", approx_tokens=120_000)
+    returned, _ = delayed._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert delayed.session_id == parent_sid
+    assert returned == messages
+    assert _count_children(db, parent_sid) == 1
+
+
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
     """The loser of the lock race must return its input messages verbatim.
 
@@ -457,13 +474,9 @@ def test_review_fork_disables_compression_to_prevent_stale_parent_fork(tmp_path:
     so it can never compress the parent it shares a session_id with
     (issue #38727).
 
-    The per-session compression lock only serialises a SAME-WINDOW concurrent
-    race. It does NOT stop a stale parent from being compressed again in a
-    LATER turn: if ``review_agent`` had won the race, its new child session is
-    never adopted by the gateway (the fork is single-lifecycle and dies right
-    after one ``run_conversation``), so the foreground path would start the
-    next turn from the stale parent and compress it AGAIN — leaving the same
-    parent with two sibling children.
+    The per-session compression lock and stale-parent check protect the database
+    rotation path. Disabling compression on the short-lived review agent also
+    avoids wasted summarization and keeps ownership with the foreground agent.
 
     The fix makes the review fork never trigger compression at all. Both
     compression trigger sites in ``agent/conversation_loop.py`` gate on

@@ -953,7 +953,7 @@ class GatewayStartupMixin:
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
-                clear_profile_platforms=True,
+                reset_platforms=True,
                 reload_existing=True,
                 wait_timeout=2.0,
             )

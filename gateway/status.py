@@ -1083,7 +1083,8 @@ def _prepare_runtime_status_update(
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
-    ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
+    ingress_url: Any = _UNSET, listener_base: Any = _UNSET, reset_platforms: bool = False,
+    clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
@@ -1101,9 +1102,9 @@ def _prepare_runtime_status_update(
         payload = copy.deepcopy(previous_payload)
         current_record = _build_pid_record()
         payload.setdefault("platforms", {})
-        if not isinstance(payload["platforms"], dict):
+        if reset_platforms or not isinstance(payload["platforms"], dict):
             payload["platforms"] = {}
-        if clear_profile_platforms or drop_profile_platforms:
+        elif clear_profile_platforms or drop_profile_platforms:
             drop_prefix = f"{drop_profile_platforms}:" if drop_profile_platforms else None
             payload["platforms"] = {
                 k: v for k, v in payload["platforms"].items()

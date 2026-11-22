@@ -127,6 +127,24 @@ def patch_startup_side_effects(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_startup_clears_stale_status_from_primary_and_satellite_adapters(tmp_path, monkeypatch):
+    from gateway.status import read_runtime_status, write_runtime_status
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    runner = make_startup_runner(tmp_path)
+    runner._start_loop_liveness_guards = MagicMock()
+    write_runtime_status(gateway_state="startup_failed", platform="discord", platform_state="fatal")
+    write_runtime_status(platform="satellite:telegram", platform_state="fatal")
+
+    await runner._start_log_startup_environment()
+
+    state = read_runtime_status()
+    assert state["gateway_state"] == "starting"
+    assert state["platforms"] == {}
+
+
+@pytest.mark.asyncio
 async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_path, monkeypatch):
     patch_startup_side_effects(monkeypatch, tmp_path)
 

@@ -110,6 +110,37 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+@pytest.mark.parametrize(("script", "ok", "output"), [
+    ("printf 'market open'", True, "market open"),
+    ("exit 0", True, ""),
+    ("echo 'feed unavailable' >&2; exit 1", False, "feed unavailable"),
+])
+def test_legacy_relay_runs_script_without_opening_agent_storage(hermes_env, monkeypatch, script, ok, output):
+    from unittest.mock import Mock
+    from cron.jobs import create_job
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    (hermes_env / "scripts" / "relay.sh").write_text(f"#!/bin/sh\n{script}\n")
+    job = create_job(prompt="Market update", schedule="every 5m", script="relay.sh")
+    job["relay_script_output"] = True
+    agent = Mock(side_effect=AssertionError("relay opened an agent"))
+    store = Mock(side_effect=AssertionError("relay opened agent storage"))
+    monkeypatch.setattr("run_agent.AIAgent", agent)
+    monkeypatch.setattr("persistence_assembly.open_persistence", store)
+
+    success, document, reply, error = run_job(job)
+
+    assert success is ok
+    if not ok:
+        assert output in error and output in reply
+    else:
+        assert error is None
+        assert reply == (output or SILENT_MARKER)
+    assert output in document
+    agent.assert_not_called()
+    store.assert_not_called()
+
+
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never

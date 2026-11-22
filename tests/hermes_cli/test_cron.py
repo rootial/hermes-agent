@@ -260,6 +260,22 @@ class TestCronDoctor:
 class TestCronListStatusRendering:
     """`cron list` must never paint an undelivered run as a success (#83993)."""
 
+    @pytest.mark.parametrize("stored_status", [None, "pending"])
+    def test_first_run_displays_pending_and_retains_dispatch_slot(
+        self, tmp_cron_dir, capsys, monkeypatch, stored_status,
+    ):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
+        job = create_job(prompt="Daily digest", schedule="every 1h")
+        jobs = load_jobs()
+        slot = {"scheduled_instant": job["next_run_at"]}
+        jobs[0].update(last_status=stored_status, pending_slot=slot)
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        assert "pending first run" in capsys.readouterr().out
+        assert load_jobs()[0]["pending_slot"] == slot
+
     def test_default_list_includes_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
         job = create_job(prompt="Paused digest", schedule="every 1h")

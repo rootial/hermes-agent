@@ -681,6 +681,17 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
+    @pytest.mark.parametrize(("override", "expected"), [(4096, 4096), (None, 32768)])
+    def test_run_job_forwards_job_or_model_max_tokens(self, tmp_path, override, expected):
+        (tmp_path / "config.yaml").write_text("model:\n  default: test-model\n  max_tokens: 32768\n")
+        job = {"id": "cap-job", "prompt": "hello", "max_tokens": override}
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            success, _, _, error = _run_owned_job(job, tmp_path, fake_db)
+
+        assert success, error
+        assert mock_agent_cls.call_args.kwargs["max_tokens"] == expected
+
     def test_run_job_memory_enabled_in_cron(self, tmp_path):
         """Cron agents get memory like any other agent run.
 

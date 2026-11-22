@@ -18,6 +18,11 @@ SCRIPT_IS_COMMAND_LINE_ERROR = (
 )
 
 
+def is_script_only_job(job: dict) -> bool:
+    """Recognize current and legacy script-only cron definitions."""
+    return bool(job.get("no_agent") or job.get("relay_script_output"))
+
+
 def _validate_job_mode_invariants(
     monitor_script: Optional[str],
     monitor_url: Optional[str],

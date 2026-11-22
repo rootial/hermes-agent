@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
+from cron.jobs_invariants import is_script_only_job
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[list[str]]:
@@ -213,6 +214,8 @@ def cron_list(show_all: bool = False):
 
 def _last_run_display(job: dict[str, Any]) -> str:
     last_status = job["last_status"]
+    if last_status == "pending" and not job.get("last_run_at"):
+        return color("pending first run", Colors.YELLOW)
     if last_status == "ok":
         return color("ok", Colors.GREEN)
     if last_status == "delivery_queued":
@@ -248,12 +251,12 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
-         if job.get("no_agent") else ""),
+         if is_script_only_job(job) else ""),
         ("Timezone", job.get("timezone")),
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
-        ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
+        ("Last run", "  ".join(filter(None, (job.get("last_run_at"), _last_run_display(job))))
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
         ("Execution", f"{latest_execution.get('status', '?')}  {latest_execution.get('id', '?')}"
@@ -707,7 +710,7 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
-    if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
+    if last_status and last_status not in {"pending", "ok", "delivery_failed", "delivery_queued"}:
         issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
     if delivery_err := str(job.get("last_delivery_error") or "").strip():
         issues.append(f"last run finished but the result was not delivered ({_short_reason(delivery_err)}). "
@@ -730,7 +733,7 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
         if issue:
             issues.append(issue)
     script = str(job.get("script") or "").strip()
-    if job.get("no_agent") and not script:
+    if is_script_only_job(job) and not script:
         issues.append("no-agent job has no script")
     if script and (script_issue := _script_health_issue(script)):
         issues.append(script_issue)

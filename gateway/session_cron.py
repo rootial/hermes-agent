@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import threading
 
+from cron.jobs_invariants import is_script_only_job
 from gateway.session_contract import SessionActor, SessionRef
 from gateway.session_persistence import authority_persistence
 from persistence.authority.bindings import cron_request_id
@@ -130,7 +131,7 @@ def _create(authority, actor, params):
         # guard keeps its exact retry above, and run history files it by its stored policy.
         raise AuthorityRefusal('invalid_params')
     job = get_job(jid)
-    if job is None or job.get('no_agent'):
+    if job is None or is_script_only_job(job):
         raise AuthorityRefusal('not_found')
     config = _load_gateway_config()
     private = {}

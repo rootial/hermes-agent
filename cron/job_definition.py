@@ -13,7 +13,7 @@ from hermes_time import now as _hermes_now
 
 JOB_DEFINITION_FIELDS = frozenset({
     "name", "prompt", "skills", "skill", "model", "provider", "base_url",
-    "script", "no_agent", "monitor_script", "monitor_url", "context_from",
+    "script", "no_agent", "relay_script_output", "max_tokens", "monitor_script", "monitor_url", "context_from",
     "schedule", "schedule_display", "deliver", "origin", "enabled_toolsets",
     "workdir", "attach_to_session", "reasoning_effort", "failure_deliver",
     "timezone", "grace_minutes", "catch_up", "wrap_response",

@@ -16,6 +16,8 @@ budget, and a slot lost to a restart window is a missed fire, not a job failure.
 import logging
 import os
 
+from cron.jobs_invariants import is_script_only_job
+
 logger = logging.getLogger(__name__)
 
 GATEWAY_DOWN_HINT = (
@@ -68,7 +70,7 @@ def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
     failed) when no ready gateway serves this home. Logs once per tick, not once per job."""
     from hermes_constants import get_hermes_home
 
-    agent_jobs = [job for job in due_jobs if not job.get("no_agent")]
+    agent_jobs = [job for job in due_jobs if not is_script_only_job(job)]
     if not agent_jobs:
         return due_jobs
     home = get_hermes_home().resolve()
@@ -80,4 +82,4 @@ def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
     logger.warning(
         "Cron tick for %s skipped %d agent job(s) (%s): %s",
         home, len(ids), ", ".join(ids), hint)
-    return [job for job in due_jobs if job.get("no_agent")]
+    return [job for job in due_jobs if is_script_only_job(job)]

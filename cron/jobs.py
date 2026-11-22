@@ -529,6 +529,8 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     # Derived from the scheduler-honoured ``enabled`` flag so a half-paused record cannot render
     # "paused" while still firing. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
+    if is_job_runnable(normalized) and not normalized.get("last_run_at") and not normalized.get("last_status"):
+        normalized["last_status"] = "pending"
     return normalized
 
 

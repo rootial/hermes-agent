@@ -43,9 +43,24 @@ from gateway.platforms._shared import env_is_connected, extra_or_secret as _extr
 from gateway.platforms.send_targets import StandaloneSendPolicy, regex_groups_parser
 
 
+_PINNED_EXTRA_KEYS = "_weixin_pinned_keys"
+
+
 def _extra_or_secret(extra: dict[str, Any], key: str, default: str = "") -> str:
-    """``config.extra[key]`` first, else the scoped ``WEIXIN_<KEY>``; stripped."""
+    """Scoped ``WEIXIN_<KEY>`` first, else ``config.extra[key]``, else ``default``; stripped."""
     return str(_extra_or_env(extra, key, f"WEIXIN_{key.upper()}", default)).strip()
+
+
+def _account_setting(
+    extra: dict[str, Any], key: str, default: str = "", *, pinned: frozenset[str] = frozenset(),
+) -> str:
+    """Read an account setting; per-account pinned values beat profile-level ``WEIXIN_<KEY>`` env vars."""
+    if key in pinned:
+        value = extra.get(key)
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            return str(value).strip()
+        return default
+    return _extra_or_secret(extra, key, default)
 
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -211,7 +226,7 @@ def _account_configs(hermes_home: str, config: PlatformConfig) -> dict[str, Plat
     overrides = {row["account_id"]: row for row in extra.get("accounts") or []
                  if isinstance(row, dict) and _valid_account_id(row.get("account_id"))}
     account_ids = load_indexed_weixin_account_ids(hermes_home) or list(overrides) or [primary_id]
-    shared = {key: value for key, value in extra.items() if key not in {"accounts", "account_id", "token"}}
+    shared = {key: value for key, value in extra.items() if key not in {"accounts", "account_id", "token", _PINNED_EXTRA_KEYS}}
     configs = {}
     for account_id in account_ids:
         if not _valid_account_id(account_id):
@@ -222,8 +237,16 @@ def _account_configs(hermes_home: str, config: PlatformConfig) -> dict[str, Plat
                             or persisted.get("token") or "").strip()
         account_extra = {**shared, **override, "account_id": account_id}
         account_extra.pop("token", None)
+        # Pin per-account identity and explicit per-account overrides so profile-level WEIXIN_* env vars
+        # cannot clobber secondary accounts when WeixinAdapter.__init__ resolves settings.
+        pinned = {"account_id"} | {
+            key for key, value in override.items()
+            if key != "token" and value is not None and not (isinstance(value, str) and not value.strip())
+        }
         if persisted.get("base_url") and not override.get("base_url") and (account_id != primary_id or not primary_token):
             account_extra["base_url"] = persisted["base_url"]
+            pinned.add("base_url")
+        account_extra[_PINNED_EXTRA_KEYS] = frozenset(pinned)
         configs[account_id] = replace(config, token=account_token, extra=account_extra)
     return configs
 
@@ -760,6 +783,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         account_configs = {} if account_only else _account_configs(hermes_home, config)
         if account_configs:
             config = next(iter(account_configs.values()))
+        raw_extra = config.extra or {}
+        pinned = frozenset(raw_extra.get(_PINNED_EXTRA_KEYS) or ())
+        if account_only and raw_extra.get("account_id"):
+            pinned = pinned | {"account_id"}
+        if _PINNED_EXTRA_KEYS in raw_extra:
+            config = replace(config, extra={k: v for k, v in raw_extra.items() if k != _PINNED_EXTRA_KEYS})
         super().__init__(config, Platform.WEIXIN)
         extra = config.extra or {}
         self._token_store = ContextTokenStore(hermes_home)
@@ -768,31 +797,31 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
-        self._account_id = _extra_or_secret(extra, "account_id")
+        self._account_id = _account_setting(extra, "account_id", pinned=pinned)
         self._token = str(config.token or "").strip()
         self._account_adapters = {
             account_id: WeixinAdapter(account_config, account_only=True)
             for account_id, account_config in account_configs.items() if account_id != self._account_id
         }
-        self._base_url = _extra_or_secret(extra, "base_url", ILINK_BASE_URL).rstrip("/")
-        self._cdn_base_url = _extra_or_secret(extra, "cdn_base_url", WEIXIN_CDN_BASE_URL).rstrip("/")
-        # Tunables: ``extra.<key>`` else env ``WEIXIN_<KEY>`` (e.g. WEIXIN_SEND_CHUNK_RETRIES).
-        self._send_chunk_delay_seconds = float(_extra_or_secret(extra, "send_chunk_delay_seconds", "1.5"))
-        self._send_chunk_retries = int(_extra_or_secret(extra, "send_chunk_retries", "4"))
-        self._send_chunk_retry_delay_seconds = float(_extra_or_secret(extra, "send_chunk_retry_delay_seconds", "1.0"))
+        self._base_url = _account_setting(extra, "base_url", ILINK_BASE_URL, pinned=pinned).rstrip("/")
+        self._cdn_base_url = _account_setting(extra, "cdn_base_url", WEIXIN_CDN_BASE_URL, pinned=pinned).rstrip("/")
+        # Tunables: per-account pinned override > scoped ``WEIXIN_<KEY>`` > shared ``extra.<key>``.
+        self._send_chunk_delay_seconds = float(_account_setting(extra, "send_chunk_delay_seconds", "1.5", pinned=pinned))
+        self._send_chunk_retries = int(_account_setting(extra, "send_chunk_retries", "4", pinned=pinned))
+        self._send_chunk_retry_delay_seconds = float(_account_setting(extra, "send_chunk_retry_delay_seconds", "1.0", pinned=pinned))
         self._send_text_gate = asyncio.Lock()
-        self._rate_limit_circuit_threshold = max(1, int(_extra_or_secret(extra, "rate_limit_circuit_threshold", "1")))
-        self._rate_limit_circuit_window_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_window_seconds", "30.0"))
-        self._rate_limit_circuit_open_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_open_seconds", "30.0"))
+        self._rate_limit_circuit_threshold = max(1, int(_account_setting(extra, "rate_limit_circuit_threshold", "1", pinned=pinned)))
+        self._rate_limit_circuit_window_seconds = float(_account_setting(extra, "rate_limit_circuit_window_seconds", "30.0", pinned=pinned))
+        self._rate_limit_circuit_open_seconds = float(_account_setting(extra, "rate_limit_circuit_open_seconds", "30.0", pinned=pinned))
         self._rate_limit_circuit_until: float = 0.0
         self._rate_limit_events: list[float] = []
-        self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
-        self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
+        self._dm_policy = _account_setting(extra, "dm_policy", "pairing", pinned=pinned).lower()
+        self._group_policy = _account_setting(extra, "group_policy", "disabled", pinned=pinned).lower()
         # ``extra`` wins even when falsy (an explicit empty list disables the env allowlist).
         allow_from, group_allow_from = extra.get("allow_from"), extra.get("group_allow_from")
         self._allow_from = self._coerce_list(_wx_secret("WEIXIN_ALLOWED_USERS", "") if allow_from is None else allow_from)
         self._group_allow_from = self._coerce_list(_wx_secret("WEIXIN_GROUP_ALLOWED_USERS", "") if group_allow_from is None else group_allow_from)
-        self._split_multiline_messages = _coerce_bool(_extra_or_secret(extra, "split_multiline_messages", ""), default=False)
+        self._split_multiline_messages = _coerce_bool(_account_setting(extra, "split_multiline_messages", "", pinned=pinned), default=False)
         # Text debounce batching (Telegram pattern): iLink delivers messages individually, so rapid bursts would each
         # trigger a separate agent run. Telegram cadence and ceilings (#44883); ``0`` dispatches immediately.
         self._configure_text_batch_delays()

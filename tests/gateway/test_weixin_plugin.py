@@ -67,6 +67,116 @@ async def test_registered_accounts_use_independent_pollers_and_media_routes(tmp_
 
 
 @pytest.mark.asyncio
+async def test_multi_account_env_vars_do_not_shadow_secondary_account_identity_or_overrides(tmp_path, monkeypatch):
+    monkeypatch.setattr(weixin, "get_hermes_home", lambda: tmp_path)
+    weixin.save_weixin_account(str(tmp_path), account_id="account-one", token="persisted-one", base_url="https://persisted-one.example")
+    weixin.save_weixin_account(str(tmp_path), account_id="account-two", token="persisted-two", base_url="https://persisted-two.example")
+    weixin._save_sync_buf(str(tmp_path), "account-one", "cursor-one")
+    weixin._save_sync_buf(str(tmp_path), "account-two", "cursor-two")
+    accounts_dir = tmp_path / "weixin" / "accounts"
+    (accounts_dir / "account-one.context-tokens.json").write_text(json.dumps({"peer-one": "ctx-one"}), encoding="utf-8")
+    (accounts_dir / "account-two.context-tokens.json").write_text(json.dumps({"peer-two": "ctx-two"}), encoding="utf-8")
+
+    monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "account-one")
+    monkeypatch.setenv("WEIXIN_TOKEN", "env-token-one")
+    monkeypatch.setenv("WEIXIN_BASE_URL", "https://env-one.example")
+    monkeypatch.setenv("WEIXIN_DM_POLICY", "pairing")
+
+    poll_calls = {}
+    both_polled = asyncio.Event()
+
+    async def updates(session, *, base_url, token, sync_buf, **kwargs):
+        poll_calls[token] = (base_url, sync_buf)
+        if len(poll_calls) == 2:
+            both_polled.set()
+            await asyncio.Event().wait()
+        return {"ret": 0, "msgs": [], "get_updates_buf": f"next-{sync_buf}"}
+
+    monkeypatch.setattr(weixin, "_get_updates", updates)
+    monkeypatch.setattr(WeixinAdapter, "_acquire_platform_lock", lambda *args: True)
+
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={
+            "account_id": "account-one",
+            "accounts": [{"account_id": "account-two", "dm_policy": "allowlist"}],
+        },
+    )
+    adapter = WeixinAdapter(cfg)
+    assert adapter._account_id == "account-one"
+    assert adapter._token == "env-token-one"
+    assert adapter._base_url == "https://env-one.example"
+    assert adapter._dm_policy == "pairing"
+    assert "_weixin_pinned_keys" not in (adapter.config.extra or {})
+
+    assert list(adapter._account_adapters) == ["account-two"]
+    secondary = adapter._account_adapters["account-two"]
+    assert secondary._account_id == "account-two"
+    assert secondary._token == "persisted-two"
+    assert secondary._base_url == "https://persisted-two.example"
+    assert secondary._dm_policy == "allowlist"
+    assert "_weixin_pinned_keys" not in (secondary.config.extra or {})
+
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(both_polled.wait(), timeout=2)
+        assert poll_calls == {
+            "env-token-one": ("https://env-one.example", "cursor-one"),
+            "persisted-two": ("https://persisted-two.example", "cursor-two"),
+        }
+        assert adapter._token_store.get("account-one", "peer-one") == "ctx-one"
+        assert adapter._token_store.get("account-two", "peer-two") is None
+        assert secondary._token_store.get("account-two", "peer-two") == "ctx-two"
+        assert secondary._token_store.get("account-one", "peer-one") is None
+        assert weixin._LIVE_ADAPTERS["persisted-two"] is secondary
+
+        # Live-adapter reuse path in send_weixin_direct
+        live_send = AsyncMock(return_value=weixin.SendResult(success=True, message_id="live-msg"))
+        monkeypatch.setattr(secondary, "_send_text", live_send)
+        live_res = await weixin.send_weixin_direct(extra=cfg.extra, token=None, chat_id="account-two:peer-two", message="hi")
+        assert live_res["success"] is True
+        assert live_res["context_token_used"] is True
+        live_send.assert_awaited_once_with("peer-two", "hi", None)
+    finally:
+        await adapter.disconnect()
+
+    # Throwaway-adapter fallback path in send_weixin_direct (while WEIXIN_ACCOUNT_ID is still set to account-one)
+    captured = {}
+
+    async def fake_send_message(session, *, base_url, token, to, text, context_token, client_id):
+        captured.update(base_url=base_url, token=token, to=to, text=text, context_token=context_token)
+        return {"ret": 0}
+
+    monkeypatch.setattr(weixin, "_send_message", fake_send_message)
+    throwaway_res = await weixin.send_weixin_direct(extra=cfg.extra, token=None, chat_id="account-two:peer-two", message="fallback")
+    assert throwaway_res["success"] is True
+    assert throwaway_res["context_token_used"] is True
+    assert captured == {
+        "base_url": "https://persisted-two.example",
+        "token": "persisted-two",
+        "to": "peer-two",
+        "text": "fallback",
+        "context_token": "ctx-two",
+    }
+
+    # Reversed env primary (WEIXIN_ACCOUNT_ID matches second entry in accounts.json) & direct account_only=True
+    monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "account-two")
+    monkeypatch.setenv("WEIXIN_TOKEN", "env-token-two")
+    reversed_adapter = WeixinAdapter(PlatformConfig(enabled=True))
+    assert reversed_adapter._account_id == "account-one"
+    assert reversed_adapter._token == "persisted-one"
+    assert list(reversed_adapter._account_adapters) == ["account-two"]
+    assert reversed_adapter._account_adapters["account-two"]._account_id == "account-two"
+    assert reversed_adapter._account_adapters["account-two"]._token == "env-token-two"
+
+    direct_child = WeixinAdapter(
+        PlatformConfig(enabled=True, token="tok-child", extra={"account_id": "account-one"}),
+        account_only=True,
+    )
+    assert direct_child._account_id == "account-one"
+
+
+@pytest.mark.asyncio
 async def test_poll_preserves_chat_order_while_other_chats_progress(monkeypatch):
     adapter = _make_adapter()
     adapter._poll_session = object()

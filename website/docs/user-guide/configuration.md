@@ -1245,6 +1245,17 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 5-second
 default.
 
+## Protected Skills
+
+List hand-maintained skill names under `skills.protected` to block edits,
+patches, deletions, and supporting-file changes through `skill_manage`.
+Use `'*'` to protect all existing skills.
+
+```yaml
+skills:
+  protected: [my-skill]
+```
+
 ## Gateway LaunchAgent Environment
 
 On macOS, `gateway.extra_env` adds non-secret environment variables to the

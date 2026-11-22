@@ -10,6 +10,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from hermes_cli.config import InvalidUserConfigError, cfg_get, load_config_readonly, require_parseable_user_config
+
 logger = logging.getLogger("tools.skill_manager_tool")
 
 
@@ -253,9 +255,40 @@ def _locked_guard(name: str, action: str) -> Optional[dict[str, Any]]:
         return _refusal(f"Refusing {action}: {skill_refusal(locked)}", _locked=True)
     return None
 
+def _protected_skill_guard(action: str, name: str) -> Optional[dict[str, Any]]:
+    if action not in {"edit", "patch", "delete", "write_file", "remove_file"} or not name:
+        return None
+    try:
+        require_parseable_user_config()
+        protected = cfg_get(load_config_readonly(), "skills", "protected")
+    except InvalidUserConfigError as exc:
+        return _refusal(f"Could not verify skills.protected: {exc}")
+    if protected is None:
+        return None
+    if isinstance(protected, str):
+        protected = [protected]
+    if not isinstance(protected, list) or any(not isinstance(entry, str) for entry in protected):
+        return _refusal("skills.protected must be a list of skill names.")
+    names = {entry.strip() for entry in protected}
+    if not names:
+        return None
+    from tools import skill_manager_tool as _smt
+    candidates = {name, Path(name).name}
+    if existing := _smt._find_skill(name):
+        skill_dir = existing["path"]
+        candidates.add(skill_dir.name)
+        if display_name := _smt._read_frontmatter_name(skill_dir / "SKILL.md"):
+            candidates.add(display_name)
+    if "*" in names or names.intersection(candidates):
+        return _refusal(f"Skill '{name}' is protected by config.yaml (skills.protected) and cannot run '{action}'.")
+    return None
+
+
 def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
     """Guards that run on the bare action/name before any handler, for the single-op AND the
     batch path: the content lock (every mutating action) and the ownership delete guard."""
+    if (protected := _protected_skill_guard(action, name)) is not None:
+        return protected
     if (locked := _locked_guard(name, action)) is not None:
         return locked
     if action != "delete":

@@ -1457,6 +1457,34 @@ class TestLockedGuard:
             assert "hermes curator unlock locked-skill" in res["error"], (op, res)
         assert after == before
 
+    def test_config_protects_existing_skill_from_every_mutation_and_alias(self, tmp_path, monkeypatch):
+        skills = self._profile(tmp_path, monkeypatch)
+        (skills.parent / "config.yaml").write_text("skills:\n  protected: [hand-maintained]\n")
+        with _skill_dir(skills):
+            protected = self._make(skills, "hand-maintained", category="local")
+            before = self._tree(protected)
+            results = [json.loads(skill_manage(name="local/hand-maintained", **op)) for op in self._MUTATIONS]
+            after = self._tree(protected) if protected.exists() else {}
+
+        assert all(not result["success"] and "skills.protected" in result["error"] for result in results)
+        assert after == before
+
+    def test_config_protection_rejects_batch_before_sibling_changes(self, tmp_path, monkeypatch):
+        skills = self._profile(tmp_path, monkeypatch)
+        (skills.parent / "config.yaml").write_text("skills:\n  protected: [hand-maintained]\n")
+        with _skill_dir(skills):
+            self._make(skills, "hand-maintained")
+            editable = self._make(skills, "editable")
+            before = self._tree(editable)
+            result = json.loads(skill_manage(action="", name="", operations=[
+                dict(action="write_file", name="editable", file_path="references/new.md", file_content="new"),
+                dict(action="write_file", name="hand-maintained", file_path="references/new.md", file_content="new"),
+            ]))
+            after = self._tree(editable)
+
+        assert not result["success"] and "skills.protected" in result["error"]
+        assert after == before
+
     def test_unlocked_sibling_keeps_learning_and_unlock_lifts_refusal(self, tmp_path, monkeypatch):
         from tools import skill_usage
         skills = self._profile(tmp_path, monkeypatch)

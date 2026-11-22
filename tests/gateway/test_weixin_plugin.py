@@ -24,6 +24,39 @@ def _make_adapter() -> WeixinAdapter:
     )
 
 
+@pytest.mark.asyncio
+async def test_poll_preserves_chat_order_while_other_chats_progress(monkeypatch):
+    adapter = _make_adapter()
+    adapter._poll_session = object()
+    adapter._running = True
+    other_chat_processed = asyncio.Event()
+    seen = []
+
+    async def updates(*args, **kwargs):
+        adapter._running = False
+        return {"msgs": [
+            {"message_id": "first", "from_user_id": "chat-one"},
+            {"message_id": "second", "from_user_id": "chat-one"},
+            {"message_id": "other", "from_user_id": "chat-two"},
+        ]}
+
+    async def process(message):
+        message_id = message["message_id"]
+        if message_id == "first":
+            await other_chat_processed.wait()
+        seen.append(message_id)
+        if message_id == "other":
+            other_chat_processed.set()
+
+    monkeypatch.setattr(weixin, "_get_updates", updates)
+    monkeypatch.setattr(adapter, "_process_message_safe", process)
+
+    await asyncio.wait_for(adapter._poll_loop(), timeout=2)
+    await asyncio.sleep(0)
+
+    assert seen == ["other", "first", "second"]
+
+
 
 
 class TestWeixinFormatting:

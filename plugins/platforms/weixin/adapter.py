@@ -842,10 +842,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     consecutive_failures = await backoff()
                     continue
                 consecutive_failures = 0
-                # Dispatch before persisting: the off-loop write is an await, and a disconnect that
-                # cancels it must not leave the advanced cursor on disk with this batch undelivered.
+                chats: dict[tuple[str, str], list[dict[str, Any]]] = {}
                 for message in response.get("msgs") or []:
-                    asyncio.create_task(self._process_message_safe(message))
+                    route = _guess_chat_type(message, self._account_id)
+                    chats.setdefault(route, []).append(message)
+                if chats:
+                    await asyncio.gather(*(self._process_chat_batch(messages) for messages in chats.values()))
                 # atomic_json_write fsyncs + renames: persist off the loop, and only when the cursor
                 # moved (an empty long-poll echoes the same buffer back every cycle).
                 if response.get("get_updates_buf") and str(response["get_updates_buf"]) != sync_buf:
@@ -878,6 +880,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 await old.close()
             except Exception as exc:
                 logger.debug("[%s] old poll session close failed: %s", self.name, exc)
+
+    async def _process_chat_batch(self, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            await self._process_message_safe(message)
 
     async def _process_message_safe(self, message: dict[str, Any]) -> None:
         try:

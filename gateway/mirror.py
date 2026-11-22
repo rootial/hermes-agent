@@ -87,12 +87,16 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
     the newest-started room of a threaded chat instead. Every probe runs against state.db
     before the sessions.json fallback, so a stale JSON entry never beats a live row.
     """
+    from gateway.session_context import split_account_address
+
+    account_id, chat_id = split_account_address(platform, chat_id)
     probes = (str(thread_id),) if thread_id is not None else ("1", "", str(chat_id))
     try:
         from persistence_assembly import open_persistence, profile_scope
         with open_persistence(profile_scope()) as store:
             for probe in probes:
-                session_id = store.routing.session_for_origin(platform=platform, chat_id=chat_id, thread_id=probe, user_id=user_id)
+                session_id = store.routing.session_for_origin(
+                    platform=platform, chat_id=chat_id, thread_id=probe, user_id=user_id, account_id=account_id)
                 if session_id:
                     return str(session_id)
     except Exception as e:
@@ -106,20 +110,21 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
     except Exception:
         return None
     for probe in probes:
-        session_id = _find_in_sessions_index(data, platform, chat_id, probe, user_id)
+        session_id = _find_in_sessions_index(data, platform, chat_id, probe, user_id, account_id)
         if session_id:
             return session_id
     return None
 
 
 def _find_in_sessions_index(data: dict, platform: str, chat_id: str, thread_id: str,
-                            user_id: Optional[str]) -> Optional[str]:
+                            user_id: Optional[str], account_id: Optional[str] = None) -> Optional[str]:
     """One exact-thread lookup in the pre-migration ``sessions.json`` index."""
     def _matches(entry: dict) -> bool:
         origin = entry.get("origin") or {}
         return ((origin.get("platform") or entry.get("platform", "")).lower() == platform.lower()
                 and str(origin.get("chat_id", "")) == str(chat_id)
-                and str(origin.get("thread_id") or "") == thread_id)
+                and str(origin.get("thread_id") or "") == thread_id
+                and (platform.lower() != "weixin" or (origin.get("account_id") or None) == account_id))
 
     # Keys starting with "_" (e.g. the gateway's "_README") are metadata sentinels.
     candidates = [e for k, e in data.items() if not str(k).startswith("_") and isinstance(e, dict) and _matches(e)]

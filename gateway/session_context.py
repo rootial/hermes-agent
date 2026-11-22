@@ -163,6 +163,14 @@ def account_addressed_chat_id(platform: str, chat_id: str, account_id: str | Non
     return chat_id
 
 
+def split_account_address(platform: str, chat_id: str) -> tuple[str | None, str]:
+    if platform.lower() == "weixin":
+        account_id, separator, peer = chat_id.partition(":")
+        if separator and account_id and peer:
+            return account_id, peer
+    return None, chat_id
+
+
 def set_session_vars(
     platform: str = "", source: str = "", chat_id: str = "", chat_type: str = "",
     chat_name: str = "", thread_id: str = "", user_id: str = "", user_id_alt: str = "",

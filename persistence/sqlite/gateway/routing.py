@@ -17,7 +17,7 @@ from persistence import JsonValue, SessionId, SessionRowMissing
 from persistence.core.artifacts import SessionArtifacts
 from persistence.gateway.routing import (
     ORPHAN_ADOPTION_MAX_GAP_S, NeverActivePrune, NeverActiveSession, OrphanReport, RecoveredPeerSession,
-    TopicAlreadyLinked, TopicBinding, normalize_topic_profile_name,
+    TopicAlreadyLinked, TopicBinding, normalize_topic_profile_name, weixin_route_account,
 )
 
 from .._backend import SQLiteStore, register_repository, translated
@@ -473,11 +473,12 @@ class SQLiteRoutingRepository:
 
     def session_for_origin(
         self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None,
+        account_id: str | None = None,
     ) -> str | None:
         if not platform or chat_id in (None, ""):
             return None
         query = """
-            SELECT id, user_id, started_at FROM sessions
+            SELECT id, user_id, started_at, session_key FROM sessions
             WHERE LOWER(source) = LOWER(?)
               AND session_key IS NOT NULL
               AND chat_id = ?
@@ -490,6 +491,8 @@ class SQLiteRoutingRepository:
         with translated():
             holder = self._store.holder()
             rows = [dict(r) for r in holder._read_all(query + " ORDER BY started_at DESC", params)]
+        if platform.lower() == "weixin":
+            rows = [row for row in rows if weixin_route_account(row["session_key"]) == account_id]
         if not rows:
             return None
         if user_id:

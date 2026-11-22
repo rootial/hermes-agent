@@ -29,6 +29,26 @@ def _setup_sessions(tmp_path, sessions_data):
 
 
 class TestFindSessionId:
+    def test_weixin_mirror_routes_same_peer_by_owning_account(self, tmp_path, monkeypatch):
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        peer = "same-peer@im.wechat"
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            for account in ("first", "second"):
+                source = SessionSource(Platform.WEIXIN, peer, account_id=account)
+                db.create_session(account, source="weixin", session_key=build_session_key(source),
+                                  chat_id=peer, chat_type="dm")
+        finally:
+            db.close()
+
+        assert _find_session_id("weixin", f"first:{peer}") == "first"
+        assert _find_session_id("weixin", f"second:{peer}") == "second"
+        assert _find_session_id("weixin", peer) is None
+
     def test_finds_matching_session(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "agent:main:telegram:dm": {

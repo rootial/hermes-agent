@@ -65,6 +65,14 @@ def route_namespace(session_key: Optional[str]) -> str:
     return parts[1] if len(parts) > 2 and parts[0] == "agent" and parts[1] else "main"
 
 
+def weixin_route_account(session_key: str) -> str | None:
+    """Return the account slot of a qualified Weixin route."""
+    parts = session_key.split(":", 5)
+    if len(parts) > 4 and parts[0] == "agent" and parts[2] == "weixin" and parts[3] not in {"dm", "group"}:
+        return parts[3]
+    return None
+
+
 def normalize_topic_profile_name(profile_name: Optional[str] = None) -> str:
     """The stripped profile name of a topic row; empty or missing reads ``default``."""
     name = str(profile_name or "").strip()
@@ -353,9 +361,10 @@ class RoutingRepository(Protocol):
         ...
 
     def session_for_origin(
-        self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None
+        self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None,
+        account_id: str | None = None,
     ) -> str | None:
-        """The newest open keyed session whose ``source`` equals ``platform`` under ASCII case folding and whose ``chat_id`` equals ``chat_id`` (with ``thread_id``: its empty-string-equal thread too), or ``None``. With ``user_id`` the newest exact sender match wins and several rows without one read ``None``; without it, rows carrying more than one distinct non-empty (stripped) user read ``None``. An empty ``platform`` or ``chat_id`` reads ``None``."""
+        """The newest matching open keyed session, or ``None``. Match source ASCII-case-insensitively, chat and any supplied thread exactly, and the account slot for Weixin (``None`` selects legacy unqualified routes). With ``user_id``, prefer the newest exact sender and refuse several rows without a match. Without it, refuse multiple distinct non-empty users. An empty platform or chat reads ``None``."""
         ...
 
     def orphaned_sessions(self, *, max_gap_s: float | None = None) -> tuple[OrphanReport, ...]:

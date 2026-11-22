@@ -36,6 +36,7 @@ from persistence.gateway.routing import (
     TopicBinding,
     normalize_topic_profile_name,
     route_namespace,
+    weixin_route_account,
 )
 
 from .._authority import authority_state
@@ -376,7 +377,8 @@ class InMemoryRoutingRepository:
         return RecoveredPeerSession(session=max(tuple_rows, key=self._recency), has_messages=True)
 
     def session_for_origin(
-        self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None
+        self, *, platform: str, chat_id: str, thread_id: str | None = None, user_id: str | None = None,
+        account_id: str | None = None,
     ) -> str | None:
         if not platform or chat_id in (None, ""):
             return None
@@ -388,6 +390,7 @@ class InMemoryRoutingRepository:
             and row["chat_id"] == str(chat_id)
             and row["ended_at"] is None
             and (thread_id is None or _blank(row["thread_id"]) == str(thread_id))
+            and (_ascii_lower(platform) != "weixin" or weixin_route_account(row["session_key"]) == account_id)
         ]
         if not rows:
             return None

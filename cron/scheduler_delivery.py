@@ -298,6 +298,9 @@ def _seed_cron_session(
     from gateway.config import Platform
     from gateway.session import SessionSource
     from gateway.mirror import mirror_to_session
+    from gateway.session_context import split_account_address
+
+    account_id, peer_id = split_account_address(platform_name, str(chat_id))
     seeded_session_id: Optional[str] = None
     session_store = getattr(adapter, "_session_store", None)
     if session_store is not None:
@@ -311,13 +314,13 @@ def _seed_cron_session(
             seed_chat_id = (
                 str(thread_id)
                 if discord_keys_on_thread and platform_enum == Platform.DISCORD
-                else str(chat_id)
+                else peer_id
             )
             dest_source = SessionSource(
                 platform=platform_enum, chat_id=seed_chat_id, chat_name=chat_name,
                 chat_type=chat_type,
                 user_id=user_id, user_name=user_name, thread_id=thread_id,
-                scope_id=str(scope_id) if scope_id else None)
+                scope_id=str(scope_id) if scope_id else None, account_id=account_id)
             # Create the row and pass its exact id to the mirror — origin-heuristic rediscovery
             # bails on populated chats.
             _entry = session_store.get_or_create_session(dest_source)

@@ -1041,6 +1041,33 @@ class TestLoadGatewayConfig:
         assert telegram.token == "top-token"
         assert telegram.extra["reply_prefix"] == "top"
 
+    @pytest.mark.parametrize("managed", [False, True])
+    def test_weixin_bridge_prefers_root_platform_map_unless_managed(self, tmp_path, monkeypatch, managed):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    weixin:\n"
+            "      reply_prefix: nested\n"
+            "platforms:\n"
+            "  weixin:\n"
+            "    reply_prefix: root\n",
+            encoding="utf-8",
+        )
+        if managed:
+            managed_dir = tmp_path / "managed"
+            managed_dir.mkdir()
+            (managed_dir / "config.yaml").write_text(
+                "gateway:\n  platforms:\n    weixin:\n      reply_prefix: managed\n", encoding="utf-8",
+            )
+            monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.WEIXIN].extra["reply_prefix"] == ("managed" if managed else "root")
+
     def test_shared_key_loop_bridges_allow_from_from_nested_platforms(self, tmp_path, monkeypatch):
         """Regression: shared-key loop must bridge allow_from / require_mention
         into PlatformConfig.extra even when the platform is configured only

@@ -566,7 +566,14 @@ def _load_yaml_layer(home: Path, gw_data: dict) -> None:
     # already in ``platforms_data``, which stays the base layer every config.yaml key overrides.
     authored = snapshot_authored_extra(merge_platform_sections(yaml_cfg, gateway_section, {}))
     from hermes_cli import managed_scope
-    managed_extra = _apply_managed_extra(authored, managed_scope.apply_managed_overlay({}), platforms_data)
+    managed = managed_scope.apply_managed_overlay({})
+    managed_extra = _apply_managed_extra(authored, managed, platforms_data)
+    root_platforms = _coerce_dict(yaml_cfg.get("platforms"))
+    managed_gateway_platforms = _coerce_dict(_coerce_dict(managed.get("gateway")).get("platforms"))
+    if (isinstance(gateway_platforms, dict)
+            and isinstance(root_platforms.get("weixin"), dict)
+            and "weixin" not in managed_gateway_platforms):
+        gateway_platforms = {name: block for name, block in gateway_platforms.items() if name != "weixin"}
     warned: set = set()  # one warning per conflicting (platform, key) across both copy sites
     bridge_platform_shared_keys(
         yaml_cfg, gateway_platforms, gw_data, platforms_data, targets, warned=warned, authored=authored)

@@ -2081,7 +2081,16 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
         if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
             return
         self._last_no_entries_log_at = now
-        logger.info("credential pool %s: no available entries (all exhausted or empty)", self.provider)
+        if not self._entries:
+            logger.info("credential pool %s: no available entries (all exhausted or empty)", self.provider)
+            return
+        details = [
+            {"id": entry.id, "status": entry.last_status, "error_code": entry.last_error_code,
+             "reset_at": entry.last_error_reset_at, "auth_type": entry.auth_type}
+            for entry in self._entries
+        ]
+        logger.info("credential pool %s: no available entries (count=%d, details=%s)",
+                    self.provider, len(details), details)
 
     def reclaim(self, credential_id: str, *, model: Optional[str] = None) -> Optional[PooledCredential]:
         """Entry *credential_id* once its cooldown has lifted (cleared and token-refreshed the way

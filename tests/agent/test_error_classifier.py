@@ -170,6 +170,14 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("message", ["Model not found", "Model is not available in your region"])
+    def test_403_unavailable_model_falls_back_without_rotating_credentials(self, message):
+        result = classify_api_error(MockAPIError(message, status_code=403), provider="custom")
+        assert result.reason == FailoverReason.model_not_found
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+        assert result.retryable is False
+
     def test_403_upstream_unavailable_code_is_transient_not_auth(self):
         """A gateway 403 stamped ``code=upstream_unavailable`` is a transient upstream
         outage: retried with backoff, credential untouched (#75388)."""

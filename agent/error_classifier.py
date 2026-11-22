@@ -350,7 +350,7 @@ _ROUTE_MODEL_REJECTION_PATTERNS = (
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
     "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
-    "openrouter catalog",
+    "openrouter catalog", "model is not available", "model not available", "not available in your region",
     # Nous 404 when the provider retires a :free route — the slug is dead for every
     # credential, so fall back instead of burning retries (#123180). Unlike the free-tier
     # billing wording, the account's balance/tier is not what rejected the call.
@@ -1243,6 +1243,8 @@ def _status_403(c: _Ctx) -> Verdict:
     # 403 and on established block/challenge markers; any other 403 stays auth.
     if any(p in c.msg for p in _UPSTREAM_BLOCKED_PATTERNS):
         return _V_UPSTREAM_BLOCKED
+    if any(p in c.msg for p in _MODEL_NOT_FOUND_PATTERNS):
+        return _V_MODEL_NOT_FOUND
     return _V_AUTH_FALLBACK
 
 

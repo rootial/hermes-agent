@@ -12,6 +12,8 @@ backend after 15000ms"). See #58265 for the same fix class on another message.
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import replace
 
 from agent.credential_pool import (
     NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS,
@@ -61,6 +63,20 @@ def test_empty_pool_logs_once_within_throttle_window(monkeypatch, caplog):
 
     # 50 selections, well inside one window -> exactly one log line.
     assert len(_no_entries_records(caplog)) == 1
+
+
+def test_exhausted_pool_logs_status_and_reset_without_token(caplog):
+    entry = replace(_make_entry("benched"), last_status="exhausted", last_error_code=429,
+                    last_error_reset_at=time.time() + 600)
+    pool = CredentialPool("test", [entry])
+
+    with caplog.at_level(logging.INFO, logger="agent.credential_pool"):
+        assert pool.select() is None
+
+    assert "benched" in caplog.text
+    assert "429" in caplog.text
+    assert str(entry.last_error_reset_at) in caplog.text
+    assert entry.access_token not in caplog.text
 
 
 def test_logs_again_after_throttle_window_elapses(monkeypatch, caplog):

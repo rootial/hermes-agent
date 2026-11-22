@@ -55,6 +55,14 @@ def test_catch_up_off_skips_and_books_one_missed_row_with_the_count(home):
     assert rows[0]["started_at"] is None
 
 
+def test_default_recurring_grace_tolerates_a_four_minute_scheduler_delay(home):
+    job = jobs.create_job(prompt="brief", schedule="every 5m", deliver="local", catch_up=False)
+    _park(job["id"], 240)
+
+    assert [row["id"] for row in jobs.get_due_jobs()] == [job["id"]]
+    assert _ledger(job["id"]) == []
+
+
 def test_job_catch_up_beats_the_global_setting(home):
     (home / "config.yaml").write_text("cron:\n  catch_up_missed: false\n", encoding="utf-8")
     job = jobs.create_job(prompt="scan", schedule="every 1h", deliver="local", catch_up=True)

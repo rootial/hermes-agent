@@ -947,12 +947,13 @@ def _recoverable_oneshot_run_at(
 
 
 _MIN_GRACE_SECONDS = 120
+_DEFAULT_MIN_GRACE_SECONDS = 300
 _MAX_GRACE_SECONDS = 7200
 
 
 def _compute_grace_seconds(schedule: dict, grace_minutes: Any = None) -> int:
     """How late a job can be and still catch up rather than fast-forward: half the period, clamped
-    to [120s, 2h], so daily jobs catch up but frequent jobs fast-forward quickly.
+    to [5m, 2h], allowing frequent jobs to survive a slow scheduler tick.
 
     A per-job ``grace_minutes`` overrides that window (0 = never catch up), floored at the
     120s tick tolerance: the ticker always fires a few seconds after the slot, so a 0s window
@@ -963,7 +964,7 @@ def _compute_grace_seconds(schedule: dict, grace_minutes: Any = None) -> int:
     period_seconds = _schedule_cadence_seconds(schedule)
     if not period_seconds:
         return _MIN_GRACE_SECONDS
-    return max(_MIN_GRACE_SECONDS, min(int(period_seconds) // 2, _MAX_GRACE_SECONDS))
+    return max(_DEFAULT_MIN_GRACE_SECONDS, min(int(period_seconds) // 2, _MAX_GRACE_SECONDS))
 
 
 # A recurring dispatch within this many seconds of schedule renders "on time": a busy once-a-minute

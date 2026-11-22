@@ -15,9 +15,29 @@ Hermes-owned prefix is compared, the shell tail is not.
 from __future__ import annotations
 
 import json
+import plistlib
 import re
 
 from hermes_cli import gateway as gateway_cli
+
+
+def test_generated_launchd_plist_preserves_home_and_profile_environment(monkeypatch, tmp_path):
+    home = tmp_path / "user & home"
+    profile = tmp_path / "owl & friends"
+    profile.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    (profile / "config.yaml").write_text(
+        'gateway:\n  extra_env:\n    "FEATURE&FLAG": "<enabled>"\n    HOME: ignored\n',
+        encoding="utf-8",
+    )
+
+    _, generated = _install_plist(monkeypatch, tmp_path, profile)
+    environment = plistlib.loads(generated.encode())["EnvironmentVariables"]
+
+    assert environment["HOME"] == str(home)
+    assert environment["HERMES_HOME"] == str(profile.resolve())
+    assert environment["FEATURE&FLAG"] == "<enabled>"
 
 
 def _seed_managed_node(home, version: str) -> str:

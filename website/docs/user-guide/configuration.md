@@ -1245,6 +1245,19 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 5-second
 default.
 
+## Gateway LaunchAgent Environment
+
+On macOS, `gateway.extra_env` adds non-secret environment variables to the
+generated LaunchAgent. In multiplex mode, the launching profile's configuration
+sets these process-wide variables. Hermes reserves `HOME`, `PATH`, `HERMES_HOME`,
+its supervision marker, and its bundled resource paths.
+
+```yaml
+gateway:
+  extra_env:
+    MY_FEATURE_FLAG: '1'
+```
+
 ## Gateway SessionDB Loop Guard
 
 A debugging aid for gateway stalls: a synchronous `state.db` read or write on the

@@ -18,6 +18,8 @@ from xml.sax.saxutils import escape
 from datetime import UTC
 
 from hermes_cli import gateway_service_owner
+from hermes_cli.config import load_config
+from hermes_cli.gateway_bundled_env import BUNDLED_RESOURCE_ENV_VARS, launchd_bundled_env_xml
 
 from agent.deadline import poll_until
 
@@ -371,8 +373,17 @@ def service_path_prefix_entries() -> list[str]:
     return list(dict.fromkeys(entries))
 
 
+def _launchd_extra_env_xml() -> str:
+    extra_env = (load_config().get("gateway") or {}).get("extra_env") or {}
+    reserved = {"HOME", "PATH", "HERMES_HOME", "HERMES_SUPERVISED_CHILD", *BUNDLED_RESOURCE_ENV_VARS}
+    return "".join(
+        f"\n        <key>{escape(name)}</key>\n        <string>{escape(str(value))}</string>"
+        for name, value in extra_env.items()
+        if name not in reserved
+    )
+
+
 def generate_launchd_plist() -> str:
-    from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
@@ -396,8 +407,8 @@ def generate_launchd_plist() -> str:
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )
 
-    from hermes_cli.gateway_bundled_env import launchd_bundled_env_xml
     bundled_env_xml = launchd_bundled_env_xml(_gw().get_launchd_plist_path())  # #85357
+    extra_env_xml = _launchd_extra_env_xml()
 
     # Persist the configured RLIMIT_NOFILE floor: launchd defaults to soft 256, and every plist
     # rewrite would otherwise strip a manual limit and reintroduce EMFILE crashes.
@@ -421,7 +432,7 @@ def generate_launchd_plist() -> str:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{escape(label)}</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -429,17 +440,20 @@ def generate_launchd_plist() -> str:
     </array>
     
     <key>WorkingDirectory</key>
-    <string>{working_dir}</string>
+    <string>{escape(str(working_dir))}</string>
     
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{sane_path}</string>
+        <string>{escape(sane_path)}</string>
+
+        <key>HOME</key>
+        <string>{escape(str(Path.home()))}</string>
 
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{escape(hermes_home)}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
-        <string>1</string>{bundled_env_xml}
+        <string>1</string>{bundled_env_xml}{extra_env_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -476,10 +490,10 @@ def generate_launchd_plist() -> str:
     <integer>60</integer>
 {nofile_block}
     <key>StandardOutPath</key>
-    <string>{stdout_log}</string>
+    <string>{escape(str(stdout_log))}</string>
     
     <key>StandardErrorPath</key>
-    <string>{stderr_log}</string>
+    <string>{escape(str(stderr_log))}</string>
 </dict>
 </plist>
 """

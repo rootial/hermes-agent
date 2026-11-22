@@ -33,6 +33,23 @@ def _isolate_channel_aliases(tmp_path_factory):
         yield
 
 
+def test_weixin_directory_disambiguates_the_same_peer_across_accounts(monkeypatch):
+    from gateway import channel_directory
+
+    origins = [({"chat_id": "wxid_peer", "chat_name": "Alice", "account_id": account_id}, "dm")
+               for account_id in ("account-one", "account-two")]
+    entries = channel_directory._entries_from_origins("weixin", "fixture", lambda: iter(origins))
+    monkeypatch.setattr(channel_directory, "load_directory", lambda: {"platforms": {"weixin": entries}})
+
+    assert resolve_channel_name("weixin", "Alice") is None
+    assert resolve_channel_name("weixin", "account-two/Alice") == "account-two:wxid_peer"
+    assert resolve_channel_name("weixin", "account-one:wxid_peer") == "account-one:wxid_peer"
+    from gateway.outbound.targets import resolve_send_target
+    assert "multiple accounts" in resolve_send_target("weixin", "wxid_peer")[2]
+    entries.pop(0)
+    assert resolve_send_target("weixin", "wxid_peer") == ("account-two:wxid_peer", None, None)
+
+
 def _write_directory(tmp_path, platforms):
     """Helper to write a fake channel directory."""
     data = {"updated_at": "2026-01-01T00:00:00", "platforms": platforms}

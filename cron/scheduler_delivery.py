@@ -132,11 +132,17 @@ def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
     if (
         not origin
         or str(origin.get("platform", "")).lower() != str(platform_name).lower()
-        or str(origin.get("chat_id", "")) != str(chat_id)
+        or _origin_chat_address(origin) != str(chat_id)
     ):
         return False
     origin_thread = origin.get("thread_id")
     return origin_thread is None or str(origin_thread) == str(thread_id or "")
+
+
+def _origin_chat_address(origin: dict) -> str:
+    from gateway.session_context import account_addressed_chat_id
+    return account_addressed_chat_id(str(origin.get("platform") or "").lower(),
+                                    str(origin.get("chat_id", "")), origin.get("account_id"))
 
 
 # Provenance rank for the dedup OR-merge in _resolve_delivery_targets (higher = stronger mirror
@@ -632,7 +638,7 @@ def _resolve_single_delivery_target(
         if origin:
             return {
                 "platform": origin["platform"],
-                "chat_id": str(origin["chat_id"]),
+                "chat_id": _origin_chat_address(origin),
                 "thread_id": _origin_delivery_thread(origin),
                 "_resolved_from": "origin",  # provenance for _target_mirror_eligible
             }
@@ -648,8 +654,9 @@ def _resolve_single_delivery_target(
         return None
 
     if ":" in deliver_value:
-        platform_name, rest = deliver_value.split(":", 1)
-        platform_key = platform_name.lower()
+        from gateway.outbound.targets import split_send_address
+        platform_name, rest = split_send_address(deliver_value)
+        platform_key = platform_name
         from gateway.outbound.send import prepare_send_message_platforms, resolve_send_target
         prepare_send_message_platforms()
         # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
@@ -686,7 +693,7 @@ def _resolve_single_delivery_target(
         # origin-match check in _target_mirror_eligible already covers this target.
         return {
             "platform": platform_name,
-            "chat_id": str(origin["chat_id"]),
+            "chat_id": _origin_chat_address(origin),
             "thread_id": origin.get("thread_id"),
         }
     if not _is_known_delivery_platform(platform_name):

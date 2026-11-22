@@ -649,10 +649,11 @@ class GatewaySlashCommandsMixin(
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
         from gateway.run import _home_target_env_var, _home_thread_env_var
+        from gateway.session_context import account_addressed_chat_id
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
-        chat_id = source.chat_id
-        chat_name = source.chat_name or chat_id
+        chat_name = source.chat_name or source.chat_id
+        chat_id = account_addressed_chat_id(platform_name, source.chat_id, getattr(source, "account_id", None))
         if source.platform is None:
             return t("gateway.set_home.save_failed", error=t("gateway.set_home.err_missing_platform"))
         via_relay = getattr(source, "delivered_via_upstream_relay", False) is True

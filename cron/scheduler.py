@@ -2281,7 +2281,8 @@ def _prepare_job_prompt(
 _CRON_DELIVERY_VARS = (
     "HERMES_CRON_AUTO_DELIVER_PLATFORM",
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
-    "HERMES_CRON_AUTO_DELIVER_THREAD_ID")
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID")
 
 
 class _CronRunScope:
@@ -2373,8 +2374,14 @@ def _reload_dotenv_and_publish_delivery_target(job: dict) -> None:
 
     delivery_target = _resolve_delivery_target(job)
     if delivery_target:
-        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+        platform_name = delivery_target["platform"]
+        chat_id = str(delivery_target["chat_id"])
+        account_id = ""
+        if platform_name == "weixin" and ":" in chat_id:
+            account_id, chat_id = chat_id.split(":", 1)
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(platform_name)
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(chat_id)
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID"].set(account_id)
         _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
             "" if delivery_target.get("thread_id") is None else str(delivery_target["thread_id"])
         )

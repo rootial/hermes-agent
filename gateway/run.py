@@ -3910,6 +3910,7 @@ class GatewayRunner(
             actor_id=context.actor_user_id, actor_name=context.actor_user_name, turn_event=context.turn_event,  # None: route user
             scope_id=str(getattr(source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
+            account_id=str(getattr(source, "account_id", "") or ""),
             session_key=context.session_key,
             # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
             # (and a command it yields to the background) must still see its own session.

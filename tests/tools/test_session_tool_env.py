@@ -24,6 +24,22 @@ def _parts(env):
     return env['PATH'].split(os.pathsep)
 
 
+def test_terminal_account_environment_tracks_each_session(monkeypatch):
+    from gateway import session_context
+    from tools.environments.local import _make_run_env
+
+    name = "HERMES_SESSION_ACCOUNT_ID"
+    monkeypatch.setenv(name, "stale-account")
+    monkeypatch.setattr(session_context, "_session_context_engaged", False)
+    tokens = session_context.set_session_vars(platform="weixin", account_id="owning-account")
+    try:
+        assert _make_run_env({})[name] == "owning-account"
+    finally:
+        session_context.clear_session_vars(tokens)
+    assert not _make_run_env({}).get(name)
+    assert os.environ[name] == "stale-account"
+
+
 def test_terminal_run_env_starts_from_the_sessions_toolchain(daemon_env):
     from agent.session_client_env import client_env_scope
     from tools.environments.local import _make_run_env

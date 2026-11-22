@@ -1,7 +1,16 @@
 """Weixin (personal WeChat via iLink Bot API) env -> gateway config bridge (``PlatformEntry.env_overrides``)."""
 
 from gateway.config import Platform
-from gateway.platform_env import EnvCred, strip_slash
+from gateway.platform_env import EnvCred, enable_from_env, env_home_channel, strip_slash
+
+
+def _enable_registered_accounts(config):
+    from hermes_constants import get_hermes_home
+    from .adapter import load_indexed_weixin_account_ids
+
+    if load_indexed_weixin_account_ids(str(get_hermes_home())):
+        enable_from_env(config, Platform.WEIXIN)
+        env_home_channel(config, Platform.WEIXIN, "WEIXIN_HOME_CHANNEL", strip=True)
 
 ENV_ENABLE_CREDENTIALS = ("WEIXIN_TOKEN", "WEIXIN_ACCOUNT_ID")
 ENV_OVERRIDES = (
@@ -16,6 +25,7 @@ ENV_OVERRIDES = (
         ),
         home="WEIXIN_HOME_CHANNEL", home_strip=True,
     ),
+    _enable_registered_accounts,
 )
 
 # Authorization env names (``PlatformEntry`` fields). Core reads them from this file when the

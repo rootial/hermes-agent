@@ -89,6 +89,13 @@ def resolve_send_target(
             return _validated(*parsed)
     parsed_chat_id, parsed_thread_id, explicit = _parse_target_ref(platform_name, target_ref)
     if explicit and parsed_chat_id is not None:
+        if platform_name == "weixin" and ":" not in parsed_chat_id:
+            from gateway.channel_directory import weixin_directory_addresses
+            addresses = weixin_directory_addresses(parsed_chat_id)
+            if len(addresses) > 1:
+                return None, None, "This Weixin peer has multiple accounts. Use weixin/<account_id>:<chat_id>."
+            if addresses:
+                parsed_chat_id = addresses.pop()
         return _validated(parsed_chat_id, parsed_thread_id)
     resolution_failed = False
     try:
@@ -118,3 +125,12 @@ def resolve_send_target(
     else:
         hint = "Run `hermes send --list` to see available targets."
     return None, None, f"Could not resolve '{target_ref}' on {platform_name}. {hint}"
+
+
+def split_send_address(target: str) -> tuple[str, str]:
+    platform, _, target_ref = target.partition(":")
+    platform, target_ref = platform.strip(), target_ref.strip()
+    name, slash, account_id = platform.partition("/")
+    if slash and name.lower() == "weixin" and account_id:
+        return "weixin", f"{account_id}:{target_ref}"
+    return platform.lower(), target_ref

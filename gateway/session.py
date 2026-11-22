@@ -108,6 +108,7 @@ class SessionSource:
     # (gateway/session_detached.py). It replaces the chat's key, so nothing keyed by route reaches
     # the chat's current conversation, and delivery goes nowhere.
     detached_route: Optional[str] = field(default=None, repr=False, compare=False)
+    account_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.
@@ -136,7 +137,7 @@ class SessionSource:
     _ALWAYS_FIELDS = ("chat_id", "chat_name", "chat_type", "user_id", "user_name", "thread_id", "chat_topic")
     _OPTIONAL_PRE_SCOPE = ("user_id_alt", "chat_id_alt")
     _OPTIONAL_POST_SCOPE = ("parent_chat_id", "message_id", "profile")
-    _OPTIONAL_TAIL = ("auto_thread_initial_name", "prospective_thread_id")
+    _OPTIONAL_TAIL = ("auto_thread_initial_name", "prospective_thread_id", "account_id")
 
     def to_dict(self) -> dict[str, Any]:
         d = {"platform": self.platform.value}
@@ -756,7 +757,10 @@ def build_session_key(
     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
 
-    parts = [_session_key_namespace(profile), source.platform.value, chat_type_slot]
+    parts = [_session_key_namespace(profile), source.platform.value]
+    if source.platform == Platform.WEIXIN and (account_id := getattr(source, "account_id", None)):
+        parts.append(account_id)
+    parts.append(chat_type_slot)
     if source.platform == Platform.SLACK and source.scope_id:
         parts.append(str(source.scope_id))
     if chat_id:

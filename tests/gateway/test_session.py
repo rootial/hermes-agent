@@ -26,6 +26,14 @@ from tests.fixtures.storage_read import conversation, session_row
 from tests.fixtures.storage_seed import seed_messages, seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
+
+def test_weixin_session_source_round_trips_and_isolates_accounts():
+    source = SessionSource(platform=Platform.WEIXIN, chat_id="peer", account_id="account-one")
+    assert SessionSource.from_dict(source.to_dict()) == source
+    assert build_session_key(source) == "agent:main:weixin:account-one:dm:peer"
+    assert build_session_key(replace(source, account_id="account-two")) == "agent:main:weixin:account-two:dm:peer"
+    assert build_session_key(replace(source, account_id=None)) == "agent:main:weixin:dm:peer"
+
 # Legacy name preserved for these tests; product renamed the function to
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
 # working without duplicating the suite.

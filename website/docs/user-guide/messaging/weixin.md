@@ -96,6 +96,20 @@ hermes gateway
 
 The adapter will restore saved credentials, connect to the iLink API, and begin long-polling for messages.
 
+### Connect multiple accounts
+
+Run QR setup for each account in the same Hermes profile. The profile's
+`weixin/accounts.json` lists account IDs in connection order. Each account has
+its own `weixin/accounts/<account_id>.json`, update cursor, and chat context.
+An existing single-account profile can still use `WEIXIN_ACCOUNT_ID` and its
+saved account file or `WEIXIN_TOKEN`.
+
+Set `WEIXIN_HOME_CHANNEL` to `<account_id>:<chat_id>` to select a bot and chat
+for scheduled deliveries. For an explicit send target use
+`weixin/<account_id>:<chat_id>`. `/sethome` records the account that received
+the command. Cron jobs created in a Weixin chat capture that account for
+`deliver: origin`.
+
 ## Features
 
 - **Long-poll transport** — no public endpoint, webhook, or WebSocket needed

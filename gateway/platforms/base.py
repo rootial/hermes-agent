@@ -131,6 +131,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
     if scope_id:
         metadata["slack_team_id"] = str(scope_id)
+    if platform == "weixin" and (account_id := getattr(source, "account_id", None)):
+        metadata["account_id"] = str(account_id)
     if not metadata:
         return None
     if platform == "telegram" and getattr(source, "chat_type", None) == "dm":
@@ -4592,7 +4594,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         scope_id: Optional[str] = None, guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None, message_id: Optional[str] = None,
         role_authorized: bool = False, auto_thread_created: bool = False,
-        auto_thread_initial_name: Optional[str] = None) -> SessionSource:
+        auto_thread_initial_name: Optional[str] = None, account_id: Optional[str] = None) -> SessionSource:
         """Build a SessionSource (``gateway.profile_routes`` stamps the matching ``source.profile``)."""
         from gateway.bot_loop_guard import configured_bot_user
         def _opt(value) -> Optional[str]:
@@ -4604,7 +4606,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             chat_topic=(chat_topic or "").strip() or None, user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt, is_bot=is_bot or configured_bot_user(getattr(self, "config", None), user_id),
             scope_id=_opt(scope_id), guild_id=_opt(guild_id), parent_chat_id=_opt(parent_chat_id),
-            message_id=_opt(message_id))
+            message_id=_opt(message_id), account_id=_opt(account_id))
         # Profile from configured routes, else the owning profile of a dedicated secondary bot (so no
         # later ``source.profile``-less fallback can re-route the message through the default bot's routes).
         owner_profile = getattr(self, "_owner_profile", None)

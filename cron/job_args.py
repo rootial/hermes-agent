@@ -104,6 +104,8 @@ def _origin_from_env(
         # Workspace/server scope (Slack team, Discord guild...): Slack session keys embed it,
         # so a continuable cron seed built without it would never resolve a scoped reply.
         "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
+        **({"account_id": account_id} if origin_platform == "weixin"
+           and (account_id := get_session_env("HERMES_SESSION_ACCOUNT_ID")) else {}),
     }
 
 
@@ -288,7 +290,7 @@ def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
     Cron sessions: ``origin`` (or omitted) becomes the creating run's ``platform:chat_id[:thread]``
     from HERMES_CRON_AUTO_DELIVER_*, or ``local`` when it has no concrete target; other
     elements pass through. Otherwise the scheduler would guess a home channel."""
-    from gateway.session_context import get_session_env
+    from gateway.session_context import account_addressed_chat_id, get_session_env
     from utils import is_truthy_value
     if not is_truthy_value(get_session_env("HERMES_CRON_SESSION", "")):
         return deliver
@@ -298,6 +300,7 @@ def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
         chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
         if not platform or not chat_id:
             return "local"
+        chat_id = account_addressed_chat_id(platform, chat_id, get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID"))
         thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip()
         return f"{platform}:{chat_id}:{thread_id}" if thread_id else f"{platform}:{chat_id}"
 

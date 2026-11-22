@@ -13,7 +13,7 @@ from agent.secret_scope import get_secret
 logger = logging.getLogger("tools.send_message_tool")
 
 from gateway.outbound.targets import (
-    _HOME_CHANNEL_ENV_OVERRIDES, resolve_send_target, unknown_platform_error,
+    _HOME_CHANNEL_ENV_OVERRIDES, resolve_send_target, split_send_address, unknown_platform_error,
 )
 from gateway.outbound.senders import (
     _AUDIO_EXTS, _DEFAULT_CAPTION_LIMIT, _IMAGE_EXTS, _NO_DELIVERABLE, _VIDEO_EXTS, _VOICE_EXTS,
@@ -49,8 +49,7 @@ def send_message_tool(args, **kw):
 def _resolve_tool_target(target: str, *, pass_unresolved_references: bool = False):
     """``(platform_name, chat_id, thread_id, error)``; ``chat_id`` is None when no ref was given
     (caller falls back to the home channel)."""
-    platform_name, _, target_ref = target.partition(":")
-    platform_name, target_ref = platform_name.strip().lower(), target_ref.strip() or None
+    platform_name, target_ref = split_send_address(target)
     prepare_send_message_platforms()
     if not target_ref:
         return platform_name, None, None, None
@@ -409,9 +408,11 @@ def _describe_media_for_mirror(media_files):
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
-    from gateway.session_context import get_session_env
+    from gateway.session_context import account_addressed_chat_id, get_session_env
     auto_platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
-    auto_chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    auto_chat_id = account_addressed_chat_id(
+        auto_platform, get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip(),
+        get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", "").strip())
     if not (auto_platform and auto_chat_id and auto_platform == platform_name and auto_chat_id == str(chat_id)
             and (get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None) == thread_id):
         return None

@@ -25,6 +25,48 @@ def _make_adapter() -> WeixinAdapter:
 
 
 @pytest.mark.asyncio
+async def test_registered_accounts_use_independent_pollers_and_media_routes(tmp_path, monkeypatch):
+    monkeypatch.setattr(weixin, "get_hermes_home", lambda: tmp_path)
+    for account_id in ("account-one", "account-two"):
+        weixin.save_weixin_account(str(tmp_path), account_id=account_id, token=f"fixture-{account_id}", base_url=weixin.ILINK_BASE_URL)
+        weixin._save_sync_buf(str(tmp_path), account_id, f"cursor-{account_id}")
+    cursors = {}
+    both_polling = asyncio.Event()
+
+    async def updates(session, *, token, sync_buf, **kwargs):
+        cursors[token] = sync_buf
+        if len(cursors) == 2:
+            both_polling.set()
+        await asyncio.Event().wait()
+
+    send_file = AsyncMock(return_value="sent")
+    monkeypatch.setattr(weixin, "_get_updates", updates)
+    monkeypatch.setattr(WeixinAdapter, "_acquire_platform_lock", lambda *args: True)
+    monkeypatch.setattr(WeixinAdapter, "_send_file", send_file)
+    adapter = WeixinAdapter(PlatformConfig(enabled=True, token="unrelated", extra={"account_id": "other"}))
+    assert await adapter.connect()
+    try:
+        await asyncio.wait_for(both_polling.wait(), timeout=2)
+        assert cursors == {f"fixture-{account_id}": f"cursor-{account_id}" for account_id in ("account-one", "account-two")}
+        sent = await adapter.send_image_file("account-two:peer", image_path="fixture.png")
+        assert sent.success
+        send_file.assert_awaited_once_with("peer", "fixture.png", "")
+        secondary = weixin._LIVE_ADAPTERS["fixture-account-two"]
+        assert adapter.owns_account_transport(secondary)
+        await secondary._token_store.set("account-two", "peer", "fixture-context-two")
+        assert adapter._token_store.get("account-one", "peer") is None
+        send_text = AsyncMock(return_value=weixin.SendResult(success=True, message_id="fixture-send"))
+        monkeypatch.setattr(secondary, "_send_text", send_text)
+        delivery = await weixin.send_weixin_direct(extra={}, token=None, chat_id="account-two:peer", message="test")
+        assert delivery["context_token_used"] is True
+        assert delivery["message_id"] == "fixture-send"
+        send_text.assert_awaited_once_with("peer", "test", None)
+        assert (await adapter.send("unknown-account:peer", "text")).success is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_poll_preserves_chat_order_while_other_chats_progress(monkeypatch):
     adapter = _make_adapter()
     adapter._poll_session = object()

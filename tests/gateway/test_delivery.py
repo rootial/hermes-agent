@@ -14,6 +14,14 @@ from gateway.session import SessionSource
 
 
 class TestParseTargetPlatformChat:
+    def test_weixin_delivery_address_keeps_the_owning_account(self):
+        origin = SessionSource(platform=Platform.WEIXIN, chat_id="peer", account_id="Account-2")
+        explicit = DeliveryTarget.parse("weixin/Account-2:peer")
+        assert explicit.platform == Platform.WEIXIN
+        assert explicit.chat_id == "Account-2:peer"
+        assert explicit.to_string() == "weixin/Account-2:peer"
+        assert DeliveryTarget.parse("origin", origin).chat_id == explicit.chat_id
+
     def test_explicit_telegram_chat(self):
         target = DeliveryTarget.parse("telegram:12345")
         assert target.platform == Platform.TELEGRAM

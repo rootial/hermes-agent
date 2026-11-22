@@ -26,6 +26,26 @@ from tools.env_passthrough import clear_env_passthrough
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
+def test_weixin_cron_origin_keeps_account_for_delivery_and_nested_jobs(monkeypatch):
+    from cron.job_args import _origin_from_env, _resolve_cron_context_deliver
+    from cron.scheduler import _reload_dotenv_and_publish_delivery_target
+    from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", lambda **kwargs: None)
+    tokens = set_session_vars(platform="weixin", chat_id="peer", account_id="account-two", cron_session="1")
+    try:
+        origin = _origin_from_env()
+        assert origin["account_id"] == "account-two"
+        job = {"deliver": "origin", "origin": origin}
+        assert _resolve_delivery_target(job)["chat_id"] == "account-two:peer"
+        _reload_dotenv_and_publish_delivery_target(job)
+        assert get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") == "peer"
+        assert get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID") == "account-two"
+        assert _resolve_cron_context_deliver("origin") == "weixin:account-two:peer"
+    finally:
+        clear_session_vars(tokens)
+
+
 def _run_owned_job(job, tmp_path, db=None):
     """Run the production owner bridge, preserving each test's agent/DB probes (``db`` is the handle cron opens)."""
     from gateway.session_contract import SessionRef

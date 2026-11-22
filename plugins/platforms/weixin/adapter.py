@@ -5,6 +5,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 from __future__ import annotations
 
 import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid
+from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -174,15 +175,57 @@ def _read_json(path: Path) -> Any:
 
 
 def save_weixin_account(hermes_home: str, *, account_id: str, token: str, base_url: str, user_id: str = "") -> None:
+    if not _valid_account_id(account_id):
+        raise ValueError("Invalid Weixin account ID")
     path = _account_dir(hermes_home) / f"{account_id}.json"
     saved_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     atomic_json_write(path, {"token": token, "base_url": base_url, "user_id": user_id, "saved_at": saved_at})
     with contextlib.suppress(OSError):
         path.chmod(0o600)
+    registry = Path(hermes_home) / "weixin" / "accounts.json"
+    account_ids = load_indexed_weixin_account_ids(hermes_home)
+    if account_id not in account_ids:
+        atomic_json_write(registry, [*account_ids, account_id])
 
 
 def load_weixin_account(hermes_home: str, account_id: str) -> Optional[dict[str, Any]]:
-    return _read_json(_account_dir(hermes_home) / f"{account_id}.json")
+    if not _valid_account_id(account_id):
+        return None
+    payload = _read_json(Path(hermes_home) / "weixin" / "accounts" / f"{account_id}.json")
+    return payload if isinstance(payload, dict) else None
+
+
+def _valid_account_id(account_id: str) -> bool:
+    return isinstance(account_id, str) and re.fullmatch(r"[A-Za-z0-9_@-][A-Za-z0-9._@-]*", account_id) is not None
+
+
+def load_indexed_weixin_account_ids(hermes_home: str) -> list[str]:
+    values = _read_json(Path(hermes_home) / "weixin" / "accounts.json")
+    return list(dict.fromkeys(value for value in values if _valid_account_id(value))) if isinstance(values, list) else []
+
+
+def _account_configs(hermes_home: str, config: PlatformConfig) -> dict[str, PlatformConfig]:
+    extra = config.extra or {}
+    primary_id = _extra_or_secret(extra, "account_id")
+    primary_token = str(config.token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
+    overrides = {row["account_id"]: row for row in extra.get("accounts") or []
+                 if isinstance(row, dict) and _valid_account_id(row.get("account_id"))}
+    account_ids = load_indexed_weixin_account_ids(hermes_home) or list(overrides) or [primary_id]
+    shared = {key: value for key, value in extra.items() if key not in {"accounts", "account_id", "token"}}
+    configs = {}
+    for account_id in account_ids:
+        if not _valid_account_id(account_id):
+            continue
+        override = overrides.get(account_id, {})
+        persisted = load_weixin_account(hermes_home, account_id) or {}
+        account_token = str(override.get("token") or (primary_token if account_id == primary_id else "")
+                            or persisted.get("token") or "").strip()
+        account_extra = {**shared, **override, "account_id": account_id}
+        account_extra.pop("token", None)
+        if persisted.get("base_url") and not override.get("base_url") and (account_id != primary_id or not primary_token):
+            account_extra["base_url"] = persisted["base_url"]
+        configs[account_id] = replace(config, token=account_token, extra=account_extra)
+    return configs
 
 
 class ContextTokenStore:
@@ -712,10 +755,13 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False  # WeChat cannot edit; streaming must send-final-only so the cursor (▉) is never left visible
     _SPLIT_THRESHOLD = 1800  # iLink chunks at ~2048 chars
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, *, account_only: bool = False):
+        self._hermes_home = hermes_home = str(get_hermes_home())
+        account_configs = {} if account_only else _account_configs(hermes_home, config)
+        if account_configs:
+            config = next(iter(account_configs.values()))
         super().__init__(config, Platform.WEIXIN)
         extra = config.extra or {}
-        self._hermes_home = hermes_home = str(get_hermes_home())
         self._token_store = ContextTokenStore(hermes_home)
         self._typing_cache = TypingTicketCache()
         self._poll_session: Optional[aiohttp.ClientSession] = None
@@ -723,7 +769,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
         self._account_id = _extra_or_secret(extra, "account_id")
-        self._token = str(config.token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
+        self._token = str(config.token or "").strip()
+        self._account_adapters = {
+            account_id: WeixinAdapter(account_config, account_only=True)
+            for account_id, account_config in account_configs.items() if account_id != self._account_id
+        }
         self._base_url = _extra_or_secret(extra, "base_url", ILINK_BASE_URL).rstrip("/")
         self._cdn_base_url = _extra_or_secret(extra, "cdn_base_url", WEIXIN_CDN_BASE_URL).rstrip("/")
         # Tunables: ``extra.<key>`` else env ``WEIXIN_<KEY>`` (e.g. WEIXIN_SEND_CHUNK_RETRIES).
@@ -746,10 +796,6 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # Text debounce batching (Telegram pattern): iLink delivers messages individually, so rapid bursts would each
         # trigger a separate agent run. Telegram cadence and ceilings (#44883); ``0`` dispatches immediately.
         self._configure_text_batch_delays()
-        persisted = load_weixin_account(hermes_home, self._account_id) if self._account_id and not self._token else None
-        if persisted:
-            self._token = str(persisted.get("token") or "").strip()
-            self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
 
     @staticmethod
     def _coerce_list(value: Any) -> list[str]:
@@ -759,10 +805,38 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return [str(item).strip() for item in items if str(item).strip()]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        tokens = [adapter._token for adapter in (self, *self._account_adapters.values()) if adapter._token]
+        if len(tokens) != len(set(tokens)):
+            self._set_fatal_error("weixin_duplicate_token", "Weixin accounts must have distinct tokens", retryable=False)
+            return False
+        if not await self._connect_account():
+            return False
+        for adapter in self._account_adapters.values():
+            adapter.gateway_runner = self.gateway_runner
+            adapter.set_owner_profile(getattr(self, "_owner_profile", None))
+            adapter.set_message_handler(self._message_handler)
+            adapter.set_busy_session_handler(self._busy_session_handler)
+            adapter.set_platform_event_handler(self._platform_event_handler)
+            adapter.set_authorization_check(self._authorization_check)
+            adapter.set_session_store(getattr(self, "_session_store", None))
+            adapter._runtime_status_platform_key = getattr(self, "_runtime_status_platform_key", None)
+            adapter._busy_text_mode = self._busy_text_mode
+            adapter._busy_text_debounce_seconds = self._busy_text_debounce_seconds
+            adapter._busy_text_hard_cap_seconds = self._busy_text_hard_cap_seconds
+            adapter._human_delay_range_ms = self._human_delay_range_ms
+            if not await adapter._connect_account():
+                self._set_fatal_error(adapter.fatal_error_code or "weixin_account_connect_failed",
+                                      adapter.fatal_error_message or "Weixin account connection failed",
+                                      retryable=adapter.fatal_error_retryable)
+                await self.disconnect()
+                return False
+        return True
+
+    async def _connect_account(self) -> bool:
         preflight = (
             (check_weixin_requirements(), "weixin_missing_dependency", "aiohttp and cryptography are required"),
             (self._token, "weixin_missing_token", "WEIXIN_TOKEN is required"),
-            (self._account_id, "weixin_missing_account", "WEIXIN_ACCOUNT_ID is required"))
+            (_valid_account_id(self._account_id), "weixin_missing_account", "A valid Weixin account ID is required"))
         for ok, code, reason in preflight:
             if not ok:
                 self._set_fatal_error(code, f"Weixin startup failed: {reason}", retryable=False)
@@ -793,7 +867,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        _LIVE_ADAPTERS.pop(self._token, None)
+        for adapter in self._account_adapters.values():
+            if adapter._send_session is not None or adapter._poll_session is not None:
+                await adapter.disconnect()
+        if _LIVE_ADAPTERS.get(self._token) is self:
+            del _LIVE_ADAPTERS[self._token]
         self._running = False
         for task in self._pending_text_batch_tasks.values():
             if not task.done():
@@ -922,7 +1000,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 await self._collect_media(candidate, media_paths, media_types)
         if not text and not media_paths:
             return
-        source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
+        source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id,
+                                   user_name=sender_id, account_id=self._account_id)
         event = MessageEvent(
             text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
             message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now())
@@ -1050,14 +1129,34 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             assert last_error is not None
             raise last_error
 
+    def _account_route(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> tuple[Optional[WeixinAdapter], str]:
+        prefix, separator, peer = chat_id.partition(":")
+        account_id = (metadata or {}).get("account_id")
+        if separator:
+            if not peer or not _valid_account_id(prefix) or (account_id and account_id != prefix):
+                return None, chat_id
+            account_id, chat_id = prefix, peer
+        if not account_id or account_id == self._account_id:
+            return self, chat_id
+        return self._account_adapters.get(account_id), chat_id
+
+    def owns_account_transport(self, adapter: WeixinAdapter) -> bool:
+        return any(child is adapter and child._running for child in self._account_adapters.values())
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        adapter, chat_id = self._account_route(chat_id, metadata)
+        if adapter is None:
+            return SendResult(success=False, error="Unknown or conflicting Weixin account")
+        return await adapter._send_text(chat_id, content, metadata)
+
+    async def _send_text(self, chat_id: str, content: str, metadata: Optional[dict[str, Any]]) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
-        with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
+        with self._media_delivery_scope(self.build_source(chat_id=chat_id, account_id=self._account_id)):
             media_files, cleaned_content = self.extract_media(content)
             local_files, final_content = self.extract_local_files(self.extract_images(cleaned_content)[1])
             deliveries = [(p, v, "media") for p, v in self.filter_media_delivery_paths(media_files)]
@@ -1103,22 +1202,30 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             logger.debug("[%s] typing %s failed for %s: %s", self.name, label, _safe_id(chat_id), exc)
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
-        await self._set_typing(chat_id, TYPING_START, "start")
+        adapter, chat_id = self._account_route(chat_id, metadata)
+        if adapter is not None:
+            await adapter._set_typing(chat_id, TYPING_START, "start")
 
     async def stop_typing(self, chat_id: str) -> None:
-        await self._set_typing(chat_id, TYPING_STOP, "stop")
+        adapter, chat_id = self._account_route(chat_id)
+        if adapter is not None:
+            await adapter._set_typing(chat_id, TYPING_STOP, "stop")
 
     async def send_image(self, chat_id: str, image_url: str, caption: str, reply_to: Optional[str] = None, metadata=None) -> SendResult:
+        adapter, chat_id = self._account_route(chat_id, metadata)
+        if adapter is None:
+            return SendResult(success=False, error="Unknown or conflicting Weixin account")
         cleanup = image_url.startswith(("http://", "https://"))
         try:
-            file_path = await self._download_remote_media(image_url) if cleanup else image_url.replace("file://", "")
+            file_path = await adapter._download_remote_media(image_url) if cleanup else image_url.replace("file://", "")
         except Exception as exc:  # unsafe, failed or over gateway.max_inbound_media_bytes: keep the link
             logger.warning("[%s] image download refused, sending the URL as text: %s", self.name, exc, exc_info=True)
-            return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
+            return await super().send_image(chat_id, image_url, caption, reply_to,
+                                            metadata={**(metadata or {}), "account_id": adapter._account_id})
         if not cleanup and not os.path.isabs(file_path):
             file_path = os.path.abspath(file_path)
         try:
-            return await self.send_document(chat_id, file_path, caption=caption, metadata=metadata)
+            return await adapter.send_document(chat_id, file_path, caption=caption, metadata=metadata)
         finally:
             if cleanup and file_path and os.path.exists(file_path):
                 with contextlib.suppress(OSError):
@@ -1127,27 +1234,30 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
         return await self.send_document(chat_id=chat_id, file_path=image_path, caption=caption, metadata=metadata)
 
-    async def _send_file_result(self, chat_id: str, path: str, caption: str, label: str, **kwargs: Any) -> SendResult:
-        if not self._send_session or not self._token:
+    async def _send_file_result(self, chat_id: str, path: str, caption: str, label: str, metadata=None, **kwargs: Any) -> SendResult:
+        adapter, chat_id = self._account_route(chat_id, metadata)
+        if adapter is None:
+            return SendResult(success=False, error="Unknown or conflicting Weixin account")
+        if not adapter._send_session or not adapter._token:
             return SendResult(success=False, error="Not connected")
         try:
-            return SendResult(success=True, message_id=await self._send_file(chat_id, path, caption, **kwargs))
+            return SendResult(success=True, message_id=await adapter._send_file(chat_id, path, caption, **kwargs))
         except Exception as exc:
-            logger.error("[%s] %s failed to=%s: %s", self.name, label, _safe_id(chat_id), shown := describe_proxy_error(exc, env_proxy_for_redaction(self._base_url, self._cdn_base_url, trust_env=gateway_trust_env())) or str(exc))
+            logger.error("[%s] %s failed to=%s: %s", self.name, label, _safe_id(chat_id), shown := describe_proxy_error(exc, env_proxy_for_redaction(adapter._base_url, adapter._cdn_base_url, trust_env=gateway_trust_env())) or str(exc))
             return SendResult(success=False, error=shown)
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
-        return await self._send_file_result(chat_id, file_path, caption or "", "send_document")
+        return await self._send_file_result(chat_id, file_path, caption or "", "send_document", metadata)
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
-        return await self._send_file_result(chat_id, video_path, caption or "", "send_video")
+        return await self._send_file_result(chat_id, video_path, caption or "", "send_video", metadata)
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
         # Native outbound voice bubbles are not proven-working upstream; a file attachment at least plays (even .silk).
-        return await self._send_file_result(chat_id, audio_path, caption or self.warning_text(t("platform.weixin.voice_as_attachment")), "send_voice", force_file_attachment=True)
+        return await self._send_file_result(chat_id, audio_path, caption or self.warning_text(t("platform.weixin.voice_as_attachment")), "send_voice", metadata, force_file_attachment=True)
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
@@ -1248,24 +1358,30 @@ async def send_weixin_direct(
     *, extra: dict[str, Any], token: Optional[str], chat_id: str, message: str, media_files: Optional[list[tuple[str, bool]]] = None,
 ) -> dict[str, Any]:
     """One-shot send for ``send_message``/cron: reuse the live adapter's session on this loop, else a throwaway adapter."""
-    account_id = _extra_or_secret(extra, "account_id")
-    base_url = _extra_or_secret(extra, "base_url", ILINK_BASE_URL).rstrip("/")
-    cdn_base_url = _extra_or_secret(extra, "cdn_base_url", WEIXIN_CDN_BASE_URL).rstrip("/")
-    resolved_token = str(token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
+    hermes_home = str(get_hermes_home())
+    configs = _account_configs(hermes_home, PlatformConfig(enabled=True, token=token, extra=extra))
+    account_id, separator, peer = chat_id.partition(":")
+    if separator:
+        if not peer or account_id not in configs:
+            return {"error": "Unknown Weixin account or missing peer"}
+        config, chat_id = configs[account_id], peer
+    elif configs:
+        account_id, config = next(iter(configs.items()))
+    else:
+        return {"error": "Weixin account ID missing. Configure a Weixin account before sending."}
+    resolved_token = config.token
     if not resolved_token:
         return {"error": "Weixin token missing. Configure WEIXIN_TOKEN or platforms.weixin.token."}
-    if not account_id:
-        return {"error": "Weixin account ID missing. Configure WEIXIN_ACCOUNT_ID or platforms.weixin.extra.account_id."}
-    token_store = ContextTokenStore(str(get_hermes_home()))
+    token_store = ContextTokenStore(hermes_home)
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
     live_adapter = _LIVE_ADAPTERS.get(resolved_token)
     send_session = getattr(live_adapter, '_send_session', None)
-    if send_session is not None and not send_session.closed and send_session._loop is asyncio.get_running_loop():
+    if (send_session is not None and not send_session.closed and send_session._loop is asyncio.get_running_loop()
+            and live_adapter._account_id == account_id and live_adapter._hermes_home == hermes_home):
         return await _deliver_direct(live_adapter, chat_id, message, media_files, context_token)
     async with _new_session() as session:
-        merged = {**dict(extra or {}), "account_id": account_id, "base_url": base_url, "cdn_base_url": cdn_base_url}
-        adapter = WeixinAdapter(PlatformConfig(enabled=True, token=resolved_token, extra=merged))
+        adapter = WeixinAdapter(config, account_only=True)
         adapter._send_session = adapter._session = session
         adapter._token_store = token_store
         return await _deliver_direct(adapter, chat_id, message, media_files, context_token)
@@ -1285,17 +1401,14 @@ _env_configured = env_is_connected("WEIXIN_ACCOUNT_ID", "WEIXIN_TOKEN")
 def _config_connected(config: Any) -> bool:
     """``config_connected_fn``: account_id AND token in the merged PlatformConfig; a token alone is
     not enough, so this platform opts out of the generic ``token or api_key`` shortcut."""
-    return bool(config.extra.get("account_id") and (config.token or config.extra.get("token")))
+    return any(item.token for item in _account_configs(str(get_hermes_home()), config).values())
 
 
 def _is_connected(config: Any) -> bool:
     """Account ID AND token, from ``config`` or the scoped ``WEIXIN_*`` env (``gateway/config.py``'s
     Weixin connected check reads the same pair), else ``.env``, which a plain CLI process never loads
     into the environment (the old static setup row read it)."""
-    extra = getattr(config, "extra", None) or {}
-    account = _extra_or_secret(extra, "account_id")
-    token = str(getattr(config, "token", None) or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
-    return bool(account and token) or _env_configured(config)
+    return bool(config and _config_connected(config)) or _env_configured(config)
 
 
 async def _standalone_send(pconfig: Any, chat_id: str, message: str, *, thread_id: Optional[str] = None,
@@ -1410,7 +1523,7 @@ def interactive_setup() -> None:
 
     if user_id:
         print()
-        offer_home_channel("WEIXIN_HOME_CHANNEL", user_id, "your Weixin user ID")
+        offer_home_channel("WEIXIN_HOME_CHANNEL", f"{account_id}:{user_id}", "your Weixin user ID")
     print()
     gw.print_success("Weixin configured!")
     gw.print_info(f"  Account ID: {account_id}")
@@ -1426,7 +1539,7 @@ _PLATFORM_HINT = (
     "supported, and other files arrive as downloadable documents. You can also include image URLs in markdown "
     "format ![alt](url) and they will be downloaded and sent as native media when possible."
 )
-_SEND_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
+_SEND_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper|[A-Za-z0-9_@-][A-Za-z0-9._@-]*:[A-Za-z0-9._@-]+)\s*$")
 
 
 def register(ctx) -> None:

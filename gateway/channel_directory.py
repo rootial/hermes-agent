@@ -95,6 +95,8 @@ def _channel_target_name(platform_name: str, channel: dict[str, Any]) -> str:
     name = channel["name"]
     if platform_name == "discord":
         return f"#{name}" if channel.get("guild") else name
+    if platform_name == "weixin" and channel.get("account_id"):
+        return f"{channel['account_id']}/{name}"
     return f"{name} ({channel['type']})" if channel.get("type") else name
 
 
@@ -366,17 +368,23 @@ def _build_from_sessions(platform_name: str) -> list[dict[str, str]]:
 def _entries_from_origins(platform_name: str, source: str, origins_fn) -> list[dict[str, Any]]:
     """Deduped entries for the (origin, chat_type) pairs from ``origins_fn()``; a mid-iteration
     failure keeps entries read so far."""
+    from gateway.session_context import account_addressed_chat_id
+
     entries: list[dict[str, Any]] = []
     try:
         seen_ids = set()
         for origin, chat_type in origins_fn():
             entry_id = _session_entry_id(origin)
+            account_id = origin.get("account_id") if platform_name == "weixin" else None
+            if entry_id and account_id:
+                entry_id = account_addressed_chat_id(platform_name, entry_id, account_id)
             if not entry_id or entry_id in seen_ids:
                 continue
             seen_ids.add(entry_id)
             entries.append({
                 "id": entry_id, "name": _session_entry_name(origin),
                 "type": chat_type, "thread_id": origin.get("thread_id"),
+                **({"account_id": account_id} if account_id else {}),
             })
     except Exception as e:
         logger.debug("Channel directory: %s for %s: %s", source, platform_name, e)
@@ -436,6 +444,12 @@ def lookup_channel_type(platform_name: str, chat_id: str) -> Optional[str]:
     return next((ch.get("type") for ch in channels if ch.get("id") == chat_id), None)
 
 
+def weixin_directory_addresses(peer_id: str) -> set[str]:
+    channels = load_directory().get("platforms", {}).get("weixin", [])
+    return {channel["id"] for channel in channels if channel.get("account_id")
+            and isinstance(channel.get("id"), str) and channel["id"].partition(":")[2] == peer_id}
+
+
 def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     """Resolve a friendly channel name (e.g. "bot-home", "#bot-home", "GuildName/bot-home",
     Slack "#engineering") to an ID; case-insensitive, first match wins."""
@@ -450,9 +464,10 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
             return ch["id"]
     query = _normalize_channel_query(name)
     # 1. Exact name match, including the display labels shown by `hermes send --list`
-    for ch in channels:
-        if query in (_normalize_channel_query(ch["name"]), _normalize_channel_query(_channel_target_name(platform_name, ch))):
-            return ch["id"]
+    exact_matches = [ch for ch in channels
+                     if query in (_normalize_channel_query(ch["name"]), _normalize_channel_query(_channel_target_name(platform_name, ch)))]
+    if exact_matches:
+        return exact_matches[0]["id"] if platform_name != "weixin" or len(exact_matches) == 1 else None
     # 2. Guild-qualified match for Discord ("GuildName/channel")
     if "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)

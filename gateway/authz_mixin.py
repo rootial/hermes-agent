@@ -485,10 +485,17 @@ class GatewayAuthorizationMixin:
 
     def _owning_profile(self, adapter, platform):
         """Return (registered, profile) for a live adapter: profile is None for primary."""
-        if adapter is self._primary_adapters().get(platform):
+        def owns(registered):
+            return adapter is registered or (
+                platform == Platform.WEIXIN
+                and callable(contains := getattr(registered, "owns_account_transport", None))
+                and contains(adapter) is True
+            )
+
+        if owns(self._primary_adapters().get(platform)):
             return True, None
         for profile, profile_adapters in self._profile_adapters_map().items():
-            if adapter is profile_adapters.get(platform):
+            if owns(profile_adapters.get(platform)):
                 return True, profile
         return False, None
 

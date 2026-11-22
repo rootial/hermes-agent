@@ -12,6 +12,8 @@ from hermes_cli.config import get_hermes_home
 
 from .config import Platform, GatewayConfig, PlatformConfig
 from .session import SessionSource
+from .session_context import account_addressed_chat_id
+from .outbound.targets import split_send_address
 from .dead_targets import DeadTargetRegistry, classify_dead_error
 
 logger = logging.getLogger(__name__)
@@ -153,8 +155,13 @@ class DeliveryTarget:
         """Parse "origin" | "local" | "<platform>" | "<platform>:<chat_id>[:<thread_id>]"."""
         target = target.strip()
         if target.lower() == "origin":
-            return (cls(platform=origin.platform, chat_id=origin.chat_id, thread_id=origin.thread_id, is_origin=True)
+            return (cls(platform=origin.platform, chat_id=account_addressed_chat_id(
+                origin.platform.value, origin.chat_id, getattr(origin, "account_id", None)),
+                thread_id=origin.thread_id, is_origin=True)
                     if origin else cls(platform=Platform.LOCAL, is_origin=True))
+        platform_name, address = split_send_address(target)
+        if platform_name == "weixin" and address:
+            return cls(platform=Platform.WEIXIN, chat_id=address, is_explicit=True)
         # Platform names are case-insensitive; chat/thread ids keep case. Unknown platforms ->
         # LOCAL for routing but preserve the raw target so deliver() reports
         # unknown_platform instead of silently saving locally.
@@ -174,6 +181,9 @@ class DeliveryTarget:
             return self.unknown_platform
         if self.platform == Platform.LOCAL:
             return "local"
+        if self.platform == Platform.WEIXIN and self.chat_id and ":" in self.chat_id:
+            account_id, chat_id = self.chat_id.split(":", 1)
+            return f"weixin/{account_id}:{chat_id}"
         parts = [self.platform.value, self.chat_id, self.thread_id if self.chat_id else None]
         return ":".join(p for p in parts if p)
 

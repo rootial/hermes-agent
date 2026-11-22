@@ -36,7 +36,7 @@ _SESSION_VARS = (
     _SESSION_CHAT_NAME, _SESSION_THREAD_ID, _SESSION_USER_ID, _SESSION_USER_ID_ALT,
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
-    _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME,
+    _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME, _SESSION_ACCOUNT_ID,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -46,7 +46,7 @@ _SESSION_VARS = (
     "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
     # The trusted sender of THIS turn. USER_ID is the session ROUTE (kanban/cron/send_message rebuild
     # routes from it) and is empty in a shared chat (Telegram observe mode); ACTOR is who asked.
-    "HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME",
+    "HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME", "HERMES_SESSION_ACCOUNT_ID",
 ))
 
 # The MessageEvent of the running gateway turn. Another sender's input folded into the running turn
@@ -68,12 +68,13 @@ _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", defaul
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+_CRON_AUTO_DELIVER_ACCOUNT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", default=_UNSET)
 
 # Legacy env-var name -> ContextVar for get_session_env (_SESSION_ASYNC_DELIVERY deliberately
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
     *_SESSION_VARS, _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
-    _CRON_AUTO_DELIVER_THREAD_ID,
+    _CRON_AUTO_DELIVER_THREAD_ID, _CRON_AUTO_DELIVER_ACCOUNT_ID,
 )}
 
 
@@ -151,9 +152,15 @@ def bound_session_key() -> str:
 
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
-    anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")
+    anchors = {key: str(value) for key in ("scope_id", "parent_chat_id", "account_id")
                if (value := getattr(source, key, None))}
     return {**(metadata or {}), **anchors} if anchors else metadata
+
+
+def account_addressed_chat_id(platform: str, chat_id: str, account_id: str | None) -> str:
+    if platform == "weixin" and account_id and chat_id:
+        return f"{account_id}:{chat_id}"
+    return chat_id
 
 
 def set_session_vars(
@@ -163,7 +170,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None, actor_id: str | None = None, actor_name: str | None = None,
-    turn_event: Any = None,
+    turn_event: Any = None, account_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -180,6 +187,7 @@ def set_session_vars(
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         cron_session, parent_chat_id, user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
+        account_id,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))

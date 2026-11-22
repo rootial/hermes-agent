@@ -11,6 +11,7 @@ import shlex
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Optional
@@ -375,9 +376,28 @@ class UpstreamTargetBroken(Exception):
         self.sha, self.path, self.error = sha, path, error
 
 
+def _prepare_fork_rebase(git_cmd: list[str], cwd: Path, pre: str, upstream: str) -> str:
+    from hermes_cli._early_recovery import is_object_id
+    from hermes_cli.update_cmd import _no_prompt_git_kwargs
+    from hermes_cli.update_custody import run_git
+
+    with tempfile.TemporaryDirectory(prefix="hermes-fork-rebase-") as tempdir:
+        worktree = Path(tempdir) / "checkout"
+        kwargs = {**_no_prompt_git_kwargs(), "check": True, "capture_output": True, "text": True}
+        run_git(git_cmd, ["worktree", "add", "--detach", "--quiet", str(worktree), pre], cwd=cwd, **kwargs)
+        try:
+            run_git(git_cmd, ["rebase", "--rebase-merges", upstream], cwd=worktree, **kwargs)
+            target = _git_stdout(git_cmd, ["rev-parse", "HEAD"], worktree)
+            if not is_object_id(target):
+                raise OSError("Could not resolve the rebased fork commit")
+            return target
+        finally:
+            run_git(git_cmd, ["worktree", "remove", "--force", str(worktree)], cwd=cwd, **kwargs)
+
+
 def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: bool = False, input_fn=None,
                                   checkout_move=None) -> bool:
-    """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
+    """Offer to add ``upstream`` and prepare a fast-forward or rebase onto its fetched commit.
 
     Returns True only when origin/main was actually verified against upstream/main; False when the check never
     happened, so the caller never reports "up to date" on an origin-only compare. Fetches only upstream/main:
@@ -410,17 +430,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
-    if origin_ahead > 0:
-        print(
-            f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
-            "  Skipping upstream sync to preserve your changes.\n"
-            "  If you want to merge upstream changes, run:\n    git pull upstream main"
-        )
-        return True
     if upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
         return True
-    print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
+    print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream")
     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,
     # and the just-fetched ref is merged (a second `git pull` fetch could move past the marker's target).
     from hermes_cli import update_cmd_commit as _commit
@@ -430,13 +443,26 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         # The marker's ``pre`` is what a killed move is restored to: never arm ``pre=``.
         print("  ✗ Could not resolve HEAD. Skipping upstream sync.")
         return False
-    target = upstream  # the counted commit is the marker's target and the merge's (m2)
+    if pre == upstream or _git_ok(git_cmd, ["merge-base", "--is-ancestor", upstream, pre], cwd):
+        return True
+    rebased = not _git_ok(git_cmd, ["merge-base", "--is-ancestor", pre, upstream], cwd)
+    if rebased:
+        print("→ Rebasing local fork commits in a temporary worktree...")
+        try:
+            target = _prepare_fork_rebase(git_cmd, cwd, pre, upstream)
+        except (OSError, subprocess.SubprocessError):
+            print("  ✗ Could not rebase the fork onto upstream. The checkout was preserved.")
+            return False
+    else:
+        target = upstream
+        print("→ Pulling from upstream...")
     # Judged BEFORE the move, like the origin target's preflight: the marker goes on git's exit 0,
     # so a broken target must never land on the strength of the caller's later guard (review G1).
     from hermes_cli.update_cmd import _UPDATE_CRITICAL_FILES
     if broken := _commit.target_syntax_error(git_cmd, cwd, target, _UPDATE_CRITICAL_FILES):
         raise UpstreamTargetBroken(target, *broken)
-    refused = _commit.arm_commit_point(git_cmd, cwd, _commit.debt_sha_for_move(pre, target), pre=pre,
+    expected = target if rebased else _commit.debt_sha_for_move(pre, target)
+    refused = _commit.arm_commit_point(git_cmd, cwd, expected, pre=pre,
                                        target=target, stash=None)
     try:
         # The fetch above already brought upstream/main: a local fast-forward (no network, so no
@@ -444,8 +470,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         # very commit counted above.
         if refused:
             raise subprocess.CalledProcessError(1, "merge", stderr=refused)  # no marker, no move
-        with (checkout_move or _no_move)(upstream):
-            run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
+        move = ["reset", "--keep", target] if rebased else ["merge", "--ff-only", target]
+        with (checkout_move or _no_move)(target):
+            run_git(git_cmd, move, cwd=cwd, check=True, **_no_prompt_git_kwargs())
+        if (landed := _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "HEAD"], cwd)) != target:
+            raise OSError(f"HEAD is on {(landed or '?')[:10]} after the fork sync, expected {target[:10]}")
     except (OSError, subprocess.SubprocessError) as exc:  # CustodyRefused is an OSError; a timeout too
         if refused or _commit.settle_failed_tree_move(cwd):
             # Back at ``pre``; that is still new code when the origin pull moved first, and disarm
@@ -459,13 +488,9 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
             print(f"    ({detail})")
         return False
     interrupted_pull_marker(cwd).unlink(missing_ok=True)  # git exited 0: whole at what it landed on
-    if (landed := _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "HEAD"], cwd)) != upstream:
-        # Not the commit the debt was armed for (O3's check, here): owed for the HEAD it is on, or
-        # handed back at the run's start commit; the caller's HEAD check refuses the update.
-        _commit.disarm_commit_obligations()
-        print(f"  ✗ HEAD is on {(landed or '?')[:10]} after the upstream merge, not {upstream[:10]}.")
-        return False
     print("  ✓ Updated from upstream")
+    if rebased:
+        print("  ℹ The rebased commits are in this checkout. The fork remote still has its previous history.")
     # The fork push waits for a validated update: ``_push_synced_fork`` after the syntax guard.
     return True
 

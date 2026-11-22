@@ -1054,7 +1054,7 @@ def _move_checkout_to(git_cmd, branch, merge_ref, target_sha, pre_pull_sha) -> N
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
     keep_stash, target_ref=None, pre_sync_sha=None, rollback_branch=None, sync_upstream=False, assume_yes=False,
-    in_place_update=False, _windows_gateway_resume=None, expected_sha=None):
+    in_place_update=False, _windows_gateway_resume=None, expected_sha=None, synced_fork_sha=None):
     """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
     custom branch -> merge, same branch -> rescue ref then reset; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns the SHA HEAD had to move off."""
@@ -1070,7 +1070,7 @@ def _pull_updates(
     merge_ref = target_ref if target_ref is not None else f"origin/{branch}"
     # Every refusal below runs inside the try: its finally names the autostash this run took.
     try:
-        target_sha = (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{merge_ref}^{{commit}}"]).stdout
+        target_sha = (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{synced_fork_sha or merge_ref}^{{commit}}"]).stdout
                       or "").strip()
         if not is_object_id(target_sha):
             # The marker must name the commit git moves to, or a killed move is unrecoverable.
@@ -1079,6 +1079,10 @@ def _pull_updates(
             sys.exit(1)
         movement_baseline = _update_movement_baseline(
             git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha)
+        if synced_fork_sha and pre_pull_sha != synced_fork_sha:
+            print("✗ HEAD moved after the upstream sync. The update stopped before another checkout move.")
+            _record_stop("head_moved")
+            sys.exit(1)
         if expected_sha and target_sha != expected_sha:
             # Channel verification is a precondition: refuse before anything moves.
             print(f"✗ {merge_ref} resolves to {target_sha[:10]}, not the selected channel commit "
@@ -1110,7 +1114,7 @@ def _pull_updates(
                 _commit.owe_restore_of(_m().PROJECT_ROOT, pre_pull_sha)
             raise
         pull_marker.unlink(missing_ok=True)  # git exited 0: the tree is whole at the target
-        if sync_upstream:
+        if sync_upstream and not synced_fork_sha:
             # Do not let a second mutation hide a failed origin merge or move an
             # unexpected branch. Keep local edits parked through the final check.
             _verify_head_after_pull(
@@ -1296,6 +1300,7 @@ class _CheckoutPlan:
     rollback_branch: str | None = None
     # The switch changed the running code with no new commits to count (commit_count == -1).
     switched_without_new_commits: bool = False
+    synced_fork_sha: str | None = None
 
 
 def _apply_parked_branch_guard(
@@ -1412,6 +1417,11 @@ def _prepare_checkout_for_update(
     commit_count = int(result.stdout.strip())
 
     apply_is_shallow = _is_shallow_checkout(git_cmd)
+    if commit_count > 0 and is_fork and branch == "main" and not apply_is_shallow:
+        unmatched = _git_run(
+            git_cmd, ["rev-list", "--right-only", "--cherry-pick", "--count", f"{base}...{target_ref}"],
+            check=True)
+        commit_count = int(unmatched.stdout.strip())
     if commit_count > 0 and apply_is_shallow:
         from hermes_cli.source_check import _github_compare_behind
         counted = _github_compare_behind(*_tip_shas(git_cmd, target_ref, base))
@@ -1437,6 +1447,7 @@ def _prepare_checkout_for_update(
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
+    synced_fork_sha = None
     if commit_count == 0 and is_fork and branch == "main" and not release_tag:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         try:
@@ -1454,6 +1465,7 @@ def _prepare_checkout_for_update(
                                      stop_class="target_syntax_error")
         post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+            synced_fork_sha = post_sync_sha
             synced_count = _count_commits_between(
                 git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
             # HEAD moving is proof of an update even if the count can't be read.
@@ -1465,7 +1477,7 @@ def _prepare_checkout_for_update(
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
         switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
         pre_sync_sha=moved_from_sha, rollback_branch=rollback_branch,
-        switched_without_new_commits=switched_without_new_commits)
+        switched_without_new_commits=switched_without_new_commits, synced_fork_sha=synced_fork_sha)
 
 
 @dataclass
@@ -1945,7 +1957,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             rollback_branch=_plan.rollback_branch,
             sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
-            expected_sha=completion_request.get("expected_sha"))
+            expected_sha=completion_request.get("expected_sha"), synced_fork_sha=_plan.synced_fork_sha)
         _apply_pulled_update(
             git_cmd, branch, movement_baseline, _plan,
             _windows_gateway_resume=_windows_gateway_resume, completion_request=completion_request)

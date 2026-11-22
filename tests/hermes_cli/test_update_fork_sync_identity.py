@@ -97,6 +97,85 @@ def _fork_behind_upstream(tmp_path, monkeypatch):
     return clone, commits
 
 
+@pytest.mark.parametrize("conflict", [False, True])
+def test_fork_rebase_uses_a_validated_target_and_leaves_conflicts_isolated(tmp_path, monkeypatch, conflict):
+    from contextlib import contextmanager
+
+    clone, upstream = _fork_behind_upstream(tmp_path, monkeypatch)
+    filename = "f.txt" if conflict else "fork.txt"
+    (clone / filename).write_text("fork change\n", encoding="utf-8")
+    _git(clone, "add", filename)
+    _git(clone, "commit", "-qm", "fork change")
+    previous = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "push", "origin", "main")
+    guarded_targets = []
+
+    @contextmanager
+    def move(target):
+        guarded_targets.append(target)
+        assert _git(clone, "rev-parse", "HEAD") == previous
+        yield
+
+    checked = _sync_with_upstream_if_needed(["git"], clone, assume_yes=True, checkout_move=move)
+    landed = _git(clone, "rev-parse", "HEAD")
+    assert (clone / filename).read_text(encoding="utf-8") == "fork change\n"
+    assert _git(clone, "status", "--porcelain") == ""
+    assert _git(clone, "rev-parse", "refs/remotes/origin/main") == previous
+    if conflict:
+        assert checked is False
+        assert guarded_targets == []
+        assert landed == previous
+    else:
+        assert checked is True
+        assert guarded_targets == [landed]
+        assert _git(clone, "rev-parse", "HEAD^") == upstream[-1]
+
+
+def test_branch_update_completes_the_rebase_and_recheck_ignores_old_fork_patches(tmp_path, monkeypatch):
+    from hermes_cli import main, update_cmd, update_cmd_commit
+
+    clone, upstream = _fork_behind_upstream(tmp_path, monkeypatch)
+    (clone / "fork.txt").write_text("fork change\n", encoding="utf-8")
+    _git(clone, "add", "fork.txt")
+    _git(clone, "commit", "-qm", "fork change")
+    previous = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "push", "origin", "main")
+    monkeypatch.setattr(main, "PROJECT_ROOT", clone)
+    update_cmd_commit.begin_update_attempt()
+    update_cmd_commit.record_run_start(["git"], clone)
+    options = dict(is_fork=True, assume_yes=True, gateway_mode=False, gw_input_fn=None,
+                   switch_branch=False, _windows_gateway_resume=None)
+
+    plan = update_cmd._prepare_checkout_for_update(["git"], "main", "main", **options)
+    assert plan.commit_count > 0
+    moved_from = update_cmd._pull_updates(
+        ["git"], "main", plan.auto_stash_ref, prompt_for_restore=False, gw_input_fn=None,
+        discard_local_changes=False, keep_stash=False, pre_sync_sha=plan.pre_sync_sha,
+        sync_upstream=True, assume_yes=True, synced_fork_sha=plan.synced_fork_sha)
+
+    assert moved_from == previous
+    assert _git(clone, "rev-parse", "HEAD^") == upstream[-1]
+    assert _git(clone, "rev-parse", "refs/remotes/origin/main") == previous
+    next_plan = update_cmd._prepare_checkout_for_update(["git"], "main", "main", **options)
+    assert next_plan.commit_count == 0
+    assert next_plan.upstream_checked
+
+
+def test_fork_banner_counts_commits_against_upstream_tracking_ref(tmp_path, monkeypatch):
+    from hermes_cli.banner import _compute_git_banner_state
+
+    clone, upstream = _fork_behind_upstream(tmp_path, monkeypatch)
+    _git(clone, "fetch", "-q", "upstream")
+    _git(clone, "merge", "--ff-only", "refs/remotes/upstream/main")
+    _git(clone, "remote", "set-url", "origin", "https://github.com/example/hermes-agent.git")
+    _git(clone, "commit", "--allow-empty", "-qm", "fork change")
+
+    state = _compute_git_banner_state(clone)
+
+    assert state == {"upstream": upstream[-1][:8], "local": _git(clone, "rev-parse", "--short=8", "HEAD"),
+                     "ahead": 1}
+
+
 def test_an_upstream_sync_whose_marker_cannot_be_written_never_moves_the_tree(tmp_path, monkeypatch):
     """The fork fast-forward is a tree move like the pull: no marker, no merge (F24)."""
     from hermes_cli import update_cmd_commit

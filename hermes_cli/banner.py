@@ -180,11 +180,23 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
         return _baked_banner_state()
-    upstream, local = (source_check._git_stdout(["rev-parse", "--short=8", rev], cwd=repo_dir) for rev in ("origin/main", "HEAD"))
+    from hermes_cli.update_cmd_git import _is_fork
+
+    origin = source_check._git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+    reference = "refs/remotes/origin/main"
+    upstream = None
+    if _is_fork(origin):
+        candidate = "refs/remotes/upstream/main"
+        upstream = source_check._git_stdout(["rev-parse", "--short=8", "--verify", candidate], cwd=repo_dir)
+        if upstream:
+            reference = candidate
+    if not upstream:
+        upstream = source_check._git_stdout(["rev-parse", "--short=8", "--verify", reference], cwd=repo_dir)
+    local = source_check._git_stdout(["rev-parse", "--short=8", "HEAD"], cwd=repo_dir)
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         return _baked_banner_state()
-    ahead = source_check._git_count(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir) or 0
+    ahead = source_check._git_count(["rev-list", "--count", f"{reference}..HEAD"], cwd=repo_dir) or 0
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 

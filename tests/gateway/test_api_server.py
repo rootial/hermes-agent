@@ -371,6 +371,11 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
+
+    async def disconnect_adapter(_app):
+        await adapter.disconnect()
+
+    app.on_cleanup.append(disconnect_adapter)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
@@ -1488,8 +1493,8 @@ class TestResponsesEndpoint:
                 )
                 assert resp.status == 200
                 data = await resp.json()
+            stored = adapter._response_store.get(data["id"])
 
-        stored = adapter._response_store.get(data["id"])
         stored_history = stored["conversation_history"]
         # Must NOT contain the original prior_history messages
         for msg in prior_history:

@@ -345,6 +345,9 @@ class TestWeixinChunkDelivery:
 
         assert first.success is False
         assert "cooldown" in (first.error or "")
+        assert f"ret={weixin.RATE_LIMIT_ERRCODE}" in first.error
+        assert f"errcode={weixin.RATE_LIMIT_ERRCODE}" in first.error
+        assert "errmsg=frequency limit" in first.error
         assert second.success is False
         assert "cooldown" in (second.error or "")
         # The first rate-limit response is retried once. The second response

@@ -1172,6 +1172,13 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def owns_account_transport(self, adapter: WeixinAdapter) -> bool:
         return any(child is adapter and child._running for child in self._account_adapters.values())
 
+    def account_transport(self, account_id: Optional[str]) -> Optional[WeixinAdapter]:
+        own_id = getattr(self, "_account_id", "")
+        if not account_id or not own_id or account_id == own_id:
+            return self
+        child = getattr(self, "_account_adapters", {}).get(account_id)
+        return child if child is not None and child._running else None
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         adapter, chat_id = self._account_route(chat_id, metadata)
         if adapter is None:

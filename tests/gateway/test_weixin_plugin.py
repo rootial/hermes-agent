@@ -177,6 +177,127 @@ async def test_multi_account_env_vars_do_not_shadow_secondary_account_identity_o
 
 
 @pytest.mark.asyncio
+async def test_secondary_account_native_admission_provenance_and_recovery(tmp_path, monkeypatch):
+    """Secondary Weixin accounts must pass native SessionAuthority provenance, replay, and recovery."""
+    from pathlib import Path
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session import SessionSource
+    from gateway.session_envelope import check_native_route, prepare_native, restore_native
+    from gateway.session_ingress_context import (
+        capture_provenance, native_callback, register_transport_home, restore_provenance,
+    )
+    from persistence.core.errors import AuthorityRefusal
+    from persistence_assembly import close_stores_under
+
+    home = tmp_path / ".hermes"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(weixin, "get_hermes_home", lambda: home)
+    for account_id in ("account-one", "account-two"):
+        weixin.save_weixin_account(
+            str(home), account_id=account_id, token=f"token-{account_id}", base_url=weixin.ILINK_BASE_URL,
+        )
+
+    both_polling = asyncio.Event()
+    seen_tokens = set()
+
+    async def updates(session, *, token, **kwargs):
+        seen_tokens.add(token)
+        if len(seen_tokens) == 2:
+            both_polling.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(weixin, "_get_updates", updates)
+    monkeypatch.setattr(WeixinAdapter, "_acquire_platform_lock", lambda *args: True)
+
+    adapter = WeixinAdapter(PlatformConfig(enabled=True))
+    secondary = adapter._account_adapters["account-two"]
+    runner = GatewayRunner(GatewayConfig())
+    process_ownership.reserve([home])
+    try:
+        await initialize_gateway_runtime(runner)
+        register_transport_home(runner, None, home)
+        runner.adapters = {Platform.WEIXIN: adapter}
+        adapter.gateway_runner = runner
+        runner._is_user_authorized_for_source = lambda *a, **k: True
+
+        assert await adapter.connect()
+        await asyncio.wait_for(both_polling.wait(), timeout=2)
+        assert adapter.account_transport("account-one") is adapter
+        assert adapter.account_transport("account-two") is secondary
+        assert adapter.account_transport("unknown-account") is None
+
+        primary_source = adapter.build_source(
+            chat_id="peer-one", chat_type="dm", user_id="peer-one", account_id="account-one",
+        )
+        secondary_source = secondary.build_source(
+            chat_id="peer-two", chat_type="dm", user_id="peer-two", account_id="account-two",
+        )
+        primary_event = MessageEvent(
+            text="hi primary", message_type=MessageType.TEXT, source=primary_source, message_id="m1",
+        )
+        secondary_event = MessageEvent(
+            text="hi secondary", message_type=MessageType.TEXT, source=secondary_source, message_id="m2",
+        )
+
+        with native_callback(runner, primary_event, home):
+            primary_prov = capture_provenance(runner, primary_event)
+        with native_callback(runner, secondary_event, home):
+            secondary_prov = capture_provenance(runner, secondary_event)
+            payload = await prepare_native(runner, secondary_event)
+
+        assert primary_prov is not None and secondary_prov is not None
+        assert primary_prov["connector"] != secondary_prov["connector"]
+        assert payload["native_text_v1"]["provenance"] == secondary_prov
+
+        # Replaying the envelope re-pins the secondary transport (not primary)
+        replayed = restore_native(payload, runner)
+        assert runner._adapter_for_source(replayed.source) is secondary
+        assert replayed.source._transport_adapter_ref() is secondary
+
+        # Restored origin without a live _transport_adapter_ref (startup recovery path)
+        entry = runner.session_store.get_or_create_session(secondary_source)
+        restored_origin = SessionSource.from_dict(secondary_source.to_dict())
+        assert getattr(restored_origin, "_transport_adapter_ref", None) is None
+        assert runner._adapter_for_source(restored_origin) is secondary
+        checked_source, checked_route = await check_native_route(
+            runner, payload, entry.session_id, restored_origin, runner._adapter_for_source(restored_origin),
+        )
+        assert checked_source.account_id == "account-two"
+        assert "account-two" in checked_route
+
+        # Spoofed account_id from primary adapter is refused fail-closed
+        spoofed_source = adapter.build_source(
+            chat_id="peer-two", chat_type="dm", user_id="peer-two", account_id="account-two",
+        )
+        spoofed_event = MessageEvent(
+            text="spoof", message_type=MessageType.TEXT, source=spoofed_source, message_id="m3",
+        )
+        with native_callback(runner, spoofed_event, home):
+            with pytest.raises(AuthorityRefusal, match="not_found"):
+                capture_provenance(runner, spoofed_event)
+
+        # Disconnected secondary account fails closed on capture, restore, and delivery lookup
+        secondary._running = False
+        assert adapter.account_transport("account-two") is None
+        assert runner._adapter_for_source(restored_origin) is None
+        with native_callback(runner, secondary_event, home):
+            with pytest.raises(AuthorityRefusal, match="not_found"):
+                capture_provenance(runner, secondary_event)
+        with pytest.raises(AuthorityRefusal, match="not_found"):
+            restore_provenance(runner, SessionSource.from_dict(secondary_source.to_dict()), secondary_prov)
+    finally:
+        await adapter.disconnect()
+        for authority in list(getattr(runner, "session_authorities", []) or []):
+            close_stores_under(authority.persistence.scope.profile_dir)
+        process_ownership.release(home)
+
+
+@pytest.mark.asyncio
 async def test_poll_preserves_chat_order_while_other_chats_progress(monkeypatch):
     adapter = _make_adapter()
     adapter._poll_session = object()

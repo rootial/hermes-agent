@@ -389,6 +389,16 @@ class GatewayAuthorizationMixin:
         except Exception:
             return False
 
+    @staticmethod
+    def _resolve_account_transport(adapter, source: Optional[SessionSource]):
+        """Narrow a multi-account Weixin adapter to the account named on *source*."""
+        if (adapter is None or source is None
+                or getattr(source, "platform", None) != Platform.WEIXIN
+                or not (account_id := getattr(source, "account_id", None))):
+            return adapter
+        resolve = getattr(adapter, "account_transport", None)
+        return resolve(account_id) if callable(resolve) else adapter
+
     def _intake_adapter_for(self, source: Optional[SessionSource]):
         """The adapter that RECEIVED *source*'s event — the only one whose intake policy (ignored
         channels, relay fronting, re-dispatch of a still-live event) may act on it.
@@ -421,9 +431,11 @@ class GatewayAuthorizationMixin:
         # saved by an older release and restored after a restart. Neither has live provenance, so
         # intake is None and delivery resolves the runtime profile's owner. Covers LOCAL (#139060).
         if self._names_receiving_bot(source, identity):
-            return self._adapters_for_profile(identity.transport_profile).get(platform) if platform else None
+            adapter = self._adapters_for_profile(identity.transport_profile).get(platform) if platform else None
+            return self._resolve_account_transport(adapter, source)
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return self._primary_adapters().get(platform) if platform else None
+            adapter = self._primary_adapters().get(platform) if platform else None
+            return self._resolve_account_transport(adapter, source)
         return None
 
     def _delivery_adapter_for(self, source: Optional[SessionSource]):
@@ -465,7 +477,9 @@ class GatewayAuthorizationMixin:
             return self._fronting_relay(platform, identity.transport_profile)
         # Preserve the routed-primary native fallback before considering Relay.
         adapter = self._authorization_adapter(platform, profile) or self._routed_primary_adapter(source)
-        return adapter if adapter is not None else self._fronting_relay(platform, profile)
+        if adapter is not None:
+            return self._resolve_account_transport(adapter, source)
+        return self._fronting_relay(platform, profile)
 
     def _fronting_relay(self, platform: Optional[Platform], profile: Optional[str]):
         """The Relay in *profile*'s adapter map that fronts *platform*, else None.

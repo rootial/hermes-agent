@@ -138,6 +138,12 @@ def _binding(runner, source, profile):
     adapter = next((adapter for owner, adapter in candidates if owner == profile), None)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise AuthorityRefusal('not_found')
+    if not relay and platform == Platform.WEIXIN and (account_id := getattr(source, 'account_id', None)):
+        resolve_account = getattr(adapter, 'account_transport', None)
+        if callable(resolve_account):
+            adapter = resolve_account(account_id)
+            if adapter is None:
+                raise AuthorityRefusal('not_found')
     home = getattr(runner, '_native_transport_homes', {}).get(profile)
     if home is None or not home.is_dir():
         raise AuthorityRefusal('profile_mismatch')

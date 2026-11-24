@@ -36,11 +36,13 @@ from gateway.platforms.base import (
     _IMAGE_EXTS, _VIDEO_EXTS, gateway_trust_env, BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction,
     cache_audio_from_bytes_async, cache_document_from_bytes_async, cache_image_from_bytes_async,
 )
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from gateway.platforms._shared import env_is_connected, extra_or_secret as _extra_or_env, get_scoped_secret as _wx_secret
 from gateway.platforms.send_targets import StandaloneSendPolicy, regex_groups_parser
+
+from .quote_store import WeixinQuoteStore, resolve_partial_quote
 
 
 _PINNED_EXTRA_KEYS = "_weixin_pinned_keys"
@@ -601,20 +603,10 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return True if text in {"1", "true", "yes", "on"} else False if text in {"0", "false", "no", "off"} else default
 
 
-def _extract_text(item_list: list[dict[str, Any]]) -> str:
+def _extract_own_text(item_list: list[dict[str, Any]]) -> str:
     for item in item_list:
         if item.get("type") == ITEM_TEXT:
-            text = str((item.get("text_item") or {}).get("text") or "")
-            ref = item.get("ref_msg") or {}
-            ref_item = ref.get("message_item") or {}
-            if ref_item.get("type") in {ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE}:
-                title = ref.get("title") or ""
-                return f"[引用媒体: {title}]\n{text}".strip() if title else f"[引用媒体]\n{text}".strip()
-            if ref_item:
-                parts = [p for p in (str(ref["title"]) if ref.get("title") else "", _extract_text([ref_item])) if p]
-                if parts:
-                    return f"[引用: {' | '.join(parts)}]\n{text}".strip()
-            return text
+            return str((item.get("text_item") or {}).get("text") or "")
     for item in item_list:
         if item.get("type") == ITEM_VOICE:
             # Tencent's ``voice_item.text`` is their STT output and is wrong for non-Chinese audio.
@@ -631,6 +623,59 @@ def _extract_text(item_list: list[dict[str, Any]]) -> str:
             if not (voice_item.get("media") or {}) and voice_text:
                 return f"[Voice transcription provided by Weixin]\n{voice_text}"
     return ""
+
+
+def _extract_ref_msg(item_list: list[dict[str, Any]], message: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    for item in item_list:
+        ref = item.get("ref_msg")
+        if isinstance(ref, dict) and ref:
+            return ref
+    ref = (message or {}).get("ref_msg")
+    return ref if isinstance(ref, dict) else {}
+
+
+def _extract_message_id(message: dict[str, Any]) -> str:
+    return str(message.get("message_id") or "").strip() or next(
+        (item_id for item in message.get("item_list") or [] if (item_id := str(item.get("msg_id") or "").strip())), "",
+    )
+
+
+def _inline_quote(ref: dict[str, Any], ref_item: dict[str, Any], is_media: bool) -> str:
+    title = str(ref.get("title") or "").strip()
+    body = "" if is_media else _extract_own_text([ref_item])
+    return " | ".join(part for part in (title, body) if part)
+
+
+def _prepend_legacy_quote(text: str, quote_text: str, is_media: bool) -> str:
+    if not quote_text and not is_media:
+        return text
+    label = "引用媒体" if is_media else "引用"
+    prefix = f"[{label}: {quote_text}]" if quote_text else f"[{label}]"
+    return f"{prefix}\n{text}".strip()
+
+
+def _extract_text(item_list: list[dict[str, Any]]) -> str:
+    ref = _extract_ref_msg(item_list)
+    ref_item = ref.get("message_item")
+    ref_item = ref_item if isinstance(ref_item, dict) else {}
+    is_media = ref_item.get("type") in _INBOUND_MEDIA
+    return _prepend_legacy_quote(_extract_own_text(item_list), _inline_quote(ref, ref_item, is_media), is_media)
+
+
+def _media_quote_label(mime: str, name: str) -> str:
+    if mime.startswith("image/"):
+        return "[图片]"
+    if mime.startswith("video/"):
+        return "[视频]"
+    if mime.startswith("audio/"):
+        return "[语音]"
+    return f"[文件: {name}]"
+
+
+def _send_response_message_id(response: Any) -> Optional[str]:
+    if isinstance(response, dict):
+        return str(response.get("message_id") or "").strip() or None
+    return None
 
 
 _MIME_PREFIX_TYPES = (("image/", MessageType.PHOTO), ("video/", MessageType.VIDEO), ("audio/", MessageType.VOICE))
@@ -778,7 +823,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False  # WeChat cannot edit; streaming must send-final-only so the cursor (▉) is never left visible
     _SPLIT_THRESHOLD = 1800  # iLink chunks at ~2048 chars
 
-    def __init__(self, config: PlatformConfig, *, account_only: bool = False):
+    def __init__(self, config: PlatformConfig, *, account_only: bool = False, quote_store: Optional[WeixinQuoteStore] = None):
         self._hermes_home = hermes_home = str(get_hermes_home())
         account_configs = {} if account_only else _account_configs(hermes_home, config)
         if account_configs:
@@ -792,6 +837,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         super().__init__(config, Platform.WEIXIN)
         extra = config.extra or {}
         self._token_store = ContextTokenStore(hermes_home)
+        self._quote_store = quote_store if quote_store is not None else WeixinQuoteStore(hermes_home)
         self._typing_cache = TypingTicketCache()
         self._poll_session: Optional[aiohttp.ClientSession] = None
         self._send_session: Optional[aiohttp.ClientSession] = None
@@ -800,7 +846,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._account_id = _account_setting(extra, "account_id", pinned=pinned)
         self._token = str(config.token or "").strip()
         self._account_adapters = {
-            account_id: WeixinAdapter(account_config, account_only=True)
+            account_id: WeixinAdapter(account_config, account_only=True, quote_store=self._quote_store)
             for account_id, account_config in account_configs.items() if account_id != self._account_id
         }
         self._base_url = _account_setting(extra, "base_url", ILINK_BASE_URL, pinned=pinned).rstrip("/")
@@ -1001,14 +1047,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def _process_message(self, message: dict[str, Any]) -> None:
         assert self._poll_session is not None
         sender_id = str(message.get("from_user_id") or "").strip()
-        message_id = str(message.get("message_id") or "").strip()
-        if not sender_id or sender_id == self._account_id or (message_id and self._dedup.is_duplicate(message_id)):
-            return
-        # Secondary content-fingerprint dedup: upstream re-sends identical text under new message_ids.
-        item_list = message.get("item_list") or []
-        text = _extract_text(item_list)
-        if text and self._dedup.is_duplicate(f"content:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"):
-            logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
+        if not sender_id or sender_id == self._account_id:
             return
         chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
         if chat_type == "group":
@@ -1016,36 +1055,104 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 return
         elif not self._is_dm_intake_allowed(sender_id):
             return
+        message_id = _extract_message_id(message)
+        if message_id and self._dedup.is_duplicate(f"message:{effective_chat_id}:{message_id}"):
+            return
+        media_paths: list[str] = []
+        media_types: list[str] = []
+        own_media: list[dict[str, str]] = []
+        item_list = message.get("item_list") or []
+        own_text = _extract_own_text(item_list)
+        for item in item_list:
+            if record := await self._collect_media(item, media_paths, media_types):
+                own_media.append(record)
+        if message_id and (own_text or own_media):
+            await asyncio.to_thread(
+                self._quote_store.put, self._account_id, effective_chat_id, message_id,
+                direction="inbound", body=own_text, media=own_media,
+            )
+        ref = _extract_ref_msg(item_list, message)
+        ref_id, reply_text, reply_is_own, legacy_media = await self._resolve_reply(ref, effective_chat_id, media_paths, media_types)
+        text = own_text if ref_id else _prepend_legacy_quote(own_text, reply_text, legacy_media)
+        if text:
+            payload = json.dumps((own_text, ref_id, reply_text, legacy_media))
+            fingerprint = hashlib.md5(payload.encode(), usedforsecurity=False).hexdigest()
+            if self._dedup.is_duplicate(f"content:{effective_chat_id}:{sender_id}:{fingerprint}"):
+                logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, _safe_id(sender_id))
+                return
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             await self._token_store.set(self._account_id, sender_id, context_token)
-        if self._poll_session and self._token and not self._typing_cache.get(sender_id):
+        if self._token and not self._typing_cache.get(sender_id):
             asyncio.create_task(self._fetch_typing_ticket(self._poll_session, sender_id, context_token or None, "getConfig failed"))
-        media_paths: list[str] = []
-        media_types: list[str] = []
-        for item in item_list:
-            ref_item = (item.get("ref_msg") or {}).get("message_item")
-            for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
-                await self._collect_media(candidate, media_paths, media_types)
-        if not text and not media_paths:
+        if not text and not media_paths and not reply_text:
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id,
                                    user_name=sender_id, account_id=self._account_id)
         event = MessageEvent(
             text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
-            message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now())
+            message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now(),
+            reply_to_message_id=ref_id, reply_to_text=reply_text if ref_id else None, reply_to_is_own_message=reply_is_own)
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
-        if event.message_type == MessageType.TEXT:
+        if ref_id:
+            await self._flush_text_batch_now(self._text_batch_key(event))
+            await self.handle_message(event)
+        elif event.message_type == MessageType.TEXT:
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
-    async def _collect_media(self, item: dict[str, Any], media_paths: list[str], media_types: list[str]) -> None:
+    async def _resolve_reply(
+        self, ref: dict[str, Any], chat_id: str, media_paths: list[str], media_types: list[str],
+    ) -> tuple[Optional[str], str, bool, bool]:
+        """Resolve the quote and append any available reference attachments in place."""
+        if not ref:
+            return None, "", False, False
+        ref_item = ref.get("message_item")
+        ref_item = ref_item if isinstance(ref_item, dict) else {}
+        ref_id = str(ref.get("svr_id") or ref.get("message_id") or ref_item.get("msg_id") or "").strip() or None
+        is_media = ref_item.get("type") in _INBOUND_MEDIA
+        inline_text = _inline_quote(ref, ref_item, is_media)
+        inline_media = await self._collect_media(ref_item, media_paths, media_types) if is_media else None
+        record = await asyncio.to_thread(self._quote_store.find, self._account_id, chat_id, ref_id) if ref_id else None
+        quote_text, partial_used = inline_text, False
+        if record:
+            if not quote_text:
+                quote_text = record.body
+                partial_text = ref.get("partial_text")
+                if quote_text and isinstance(partial_text, dict):
+                    partial, fallback = resolve_partial_quote(quote_text, partial_text)
+                    if not fallback and partial is not None:
+                        quote_text, partial_used = partial, True
+                if not quote_text and record.media:
+                    first = record.media[0]
+                    quote_text = _media_quote_label(first["mime"], first["name"])
+            if not inline_media:
+                for entry in record.media:
+                    if entry["path"] not in media_paths and os.path.isfile(entry["path"]):
+                        media_paths.append(entry["path"])
+                        media_types.append(entry["mime"])
+        if ref_id and not quote_text:
+            quote_text = _media_quote_label(inline_media["mime"], inline_media["name"]) if inline_media else "[引用消息内容未缓存]"
+        logger.info(
+            "[%s] inbound ref_msg keys=%s ref_id=%s inline=%s cache_hit=%s partial=%s",
+            self.name, sorted(ref), bool(ref_id), bool(inline_text), record is not None, partial_used,
+        )
+        return ref_id, quote_text, record is not None and record.direction == "outbound", is_media
+
+    async def _collect_media(
+        self, item: dict[str, Any], media_paths: list[str], media_types: list[str],
+    ) -> Optional[dict[str, str]]:
         spec = _INBOUND_MEDIA.get(item.get("type"))
-        path, mime = await self._download_media(item, spec) if spec else (None, "")
+        if not spec:
+            return None
+        path, mime = await self._download_media(item, spec)
         if path:
             media_paths.append(path)
             media_types.append(mime)
+            name = clean_attachment_filename((item.get(spec[0]) or {}).get("file_name")) or Path(path).name
+            return {"path": path, "mime": mime, "name": name}
+        return None
 
     async def _download_media(self, item: dict[str, Any], spec: tuple[Any, ...]) -> tuple[Optional[str], str]:
         """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
@@ -1069,7 +1176,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 aes_key_b64=aes_key_b64, full_url=media.get("full_url"), timeout_seconds=timeout_seconds)
             return await cache_fn(data, filename), mime
         except Exception as exc:
-            logger.warning("[%s] %s download failed: %s", self.name, label, exc)
+            logger.warning("[%s] %s download failed (%s)", self.name, label, type(exc).__name__)
             return None, mime
 
     async def _fetch_typing_ticket(self, session: Any, user_id: str, context_token: Optional[str], failure_label: str) -> Optional[str]:
@@ -1098,7 +1205,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._rate_limit_circuit_until = max(self._rate_limit_circuit_until, time.monotonic() + self._rate_limit_circuit_open_seconds)
         return self._rate_limit_cooldown_remaining() > 0
 
-    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
+    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> Optional[str]:
         """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
         or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
         tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
@@ -1144,7 +1251,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         continue
                     self._rate_limit_events.clear()
                     self._rate_limit_circuit_until = 0.0
-                    return
+                    return _send_response_message_id(resp)
                 except Exception as exc:
                     last_error = exc
                     if attempt >= self._send_chunk_retries:
@@ -1189,7 +1296,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
-        last_message_id: Optional[str] = None
+        delivered_ids: list[str] = []
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
         with self._media_delivery_scope(self.build_source(chat_id=chat_id, account_id=self._account_id)):
@@ -1208,11 +1315,16 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
-                last_message_id = client_id
+                server_msg_id = await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
+                if server_msg_id:
+                    await asyncio.to_thread(
+                        self._quote_store.put, self._account_id, chat_id, server_msg_id, direction="outbound", body=chunk,
+                    )
+                delivered_ids.append(server_msg_id or client_id)
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
-            return SendResult(success=True, message_id=last_message_id)
+            return SendResult(success=True, message_id=delivered_ids[0] if delivered_ids else None,
+                              continuation_message_ids=tuple(delivered_ids[1:]))
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), shown := describe_proxy_error(exc, env_proxy_for_redaction(self._base_url, self._cdn_base_url, trust_env=gateway_trust_env())) or str(exc))
             return SendResult(success=False, error=shown)  # the text may echo the proxy URL
@@ -1334,11 +1446,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             item_lists.insert(0, [{"type": ITEM_TEXT, "text_item": {"text": self.format_message(caption)}}])
         last_message_id = ""
         for item_list in item_lists:
-            last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            client_id = f"hermes-weixin-{uuid.uuid4().hex}"
             while True:
                 resp = await _send_items(
                     self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=item_list,
-                    context_token=context_token, client_id=last_message_id)
+                    context_token=context_token, client_id=client_id)
                 ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                 if (ret is None or ret == 0) and (errcode is None or errcode == 0):
                     break
@@ -1353,6 +1465,20 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 if _is_stale_session_ret(ret, errcode, errmsg):
                     raise _session_not_ready_error(ret, errcode, errmsg)
                 raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
+            server_msg_id = _send_response_message_id(resp)
+            last_message_id = server_msg_id or client_id
+            if server_msg_id:
+                item = item_list[0]
+                body = _extract_own_text(item_list)
+                media = []
+                if item["type"] != ITEM_TEXT:
+                    mime = "audio/silk" if media_type == MEDIA_VOICE else mimetypes.guess_type(path)[0] or "application/octet-stream"
+                    name = Path(path).name
+                    body = _media_quote_label(mime, name) if media_type != MEDIA_FILE else f"[文件: {name}]"
+                    media = [{"path": os.path.abspath(path), "mime": mime, "name": name}]
+                await asyncio.to_thread(
+                    self._quote_store.put, self._account_id, chat_id, server_msg_id, direction="outbound", body=body, media=media,
+                )
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
